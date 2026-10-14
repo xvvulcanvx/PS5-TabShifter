@@ -27,7 +27,7 @@ jobs:
             -DSQLITE_THREADSAFE=0 \
             -DSQLITE_OMIT_LOAD_EXTENSION=1 \
             -DSQLITE_OMIT_WAL=1 \
-            main.c sqlite3.c -lkernel_sys -o TabShifter.elf
+            main.c sqlite3.c -lSceAppInstUtil -lkernel_sys -o TabShifter.elf
 
       - name: Upload Compiled TabShifter.elf
         uses: actions/upload-artifact@v4
