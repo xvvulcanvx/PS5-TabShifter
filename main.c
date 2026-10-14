@@ -1,6 +1,7 @@
 /*
  * PS5 TabShifter.elf v1.0 (Standalone On-Console Edition for FW 13.60+)
- * - Auto-generates custom 512x512 "TS" icon0.png & installs the TabShifter Home Screen Tile
+ * - Zero external dependencies (Generates "TS" PNG icon natively in pure C without zlib)
+ * - Auto-installs TabShifter (TBSH00001) Home Screen Tile on Media Tab
  * - Moves any game/homebrew app between Games & Media tabs (appinfo.db + app.db + param.json)
  * - Hides/Restores dead PSN Bloatware (PS Store, PS Plus, Remote Play, Share Play)
  * - Instant SceShellUI hot-reload in 1.5s
@@ -20,7 +21,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <zlib.h>
 #include <sqlite3.h>
 
 #define PORT 9095
@@ -134,7 +134,27 @@ static void backup_databases_once(void) {
     copy_file_if_missing(DB_INFO_PATH, DB_INFO_BAK);
 }
 
-/* Helper to write big-endian 32-bit integers & PNG chunks */
+/* Pure C CRC32 & Adler32 for dependency-free PNG generation */
+static uint32_t calc_crc32(const uint8_t *buf, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (-(int32_t)(crc & 1)));
+        }
+    }
+    return ~crc;
+}
+
+static uint32_t calc_adler32(const uint8_t *buf, size_t len) {
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++) {
+        a = (a + buf[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
 static void write_be32(FILE *f, uint32_t val) {
     uint8_t b[4] = { (val >> 24) & 0xff, (val >> 16) & 0xff, (val >> 8) & 0xff, val & 0xff };
     fwrite(b, 1, 4, f);
@@ -142,36 +162,38 @@ static void write_be32(FILE *f, uint32_t val) {
 
 static void write_png_chunk(FILE *f, const char type[4], const uint8_t *data, uint32_t len) {
     write_be32(f, len);
-    fwrite(type, 1, 4, f);
-    if (len > 0 && data) fwrite(data, 1, len, f);
-    uint32_t crc = crc32(0L, Z_NULL, 0);
-    crc = crc32(crc, (const Bytef *)type, 4);
-    if (len > 0 && data) crc = crc32(crc, (const Bytef *)data, len);
+    uint8_t *crc_buf = malloc(4 + len);
+    if (!crc_buf) return;
+    memcpy(crc_buf, type, 4);
+    if (len > 0 && data) memcpy(crc_buf + 4, data, len);
+    fwrite(crc_buf, 1, 4 + len, f);
+    uint32_t crc = calc_crc32(crc_buf, 4 + len);
     write_be32(f, crc);
+    free(crc_buf);
 }
 
-/* Generates a crisp 512x512 "TS" PNG icon natively in C */
+/* Generates a crisp 256x256 "TS" PNG icon natively in pure C (zero zlib dependency) */
 static void generate_ts_icon_png(const char *filepath) {
-    const int w = 512, h = 512;
+    const int w = 256, h = 256;
     size_t raw_len = (size_t)h * (1 + w * 3);
     uint8_t *raw = malloc(raw_len);
     if (!raw) return;
 
     size_t idx = 0;
     for (int y = 0; y < h; y++) {
-        raw[idx++] = 0; /* Filter type 0 */
+        raw[idx++] = 0; /* PNG filter 0 */
         for (int x = 0; x < w; x++) {
             uint8_t r = 12, g = 16, b = 28;
-            if (x < 18 || x >= w - 18 || y < 18 || y >= h - 18) {
+            if (x < 10 || x >= w - 10 || y < 10 || y >= h - 10) {
                 r = 37; g = 99; b = 235; /* Neon Blue Border */
             }
-            int t_top  = (x >= 95  && x <= 245 && y >= 150 && y <= 195);
-            int t_stem = (x >= 148 && x <= 192 && y >= 150 && y <= 365);
-            int s_top  = (x >= 275 && x <= 415 && y >= 150 && y <= 192);
-            int s_mid  = (x >= 275 && x <= 415 && y >= 236 && y <= 278);
-            int s_bot  = (x >= 275 && x <= 415 && y >= 323 && y <= 365);
-            int s_ul   = (x >= 275 && x <= 318 && y >= 150 && y <= 278);
-            int s_lr   = (x >= 372 && x <= 415 && y >= 236 && y <= 365);
+            int t_top  = (x >= 48  && x <= 122 && y >= 75  && y <= 98);
+            int t_stem = (x >= 74  && x <= 96  && y >= 75  && y <= 182);
+            int s_top  = (x >= 138 && x <= 208 && y >= 75  && y <= 96);
+            int s_mid  = (x >= 138 && x <= 208 && y >= 118 && y <= 139);
+            int s_bot  = (x >= 138 && x <= 208 && y >= 161 && y <= 182);
+            int s_ul   = (x >= 138 && x <= 159 && y >= 75  && y <= 139);
+            int s_lr   = (x >= 186 && x <= 208 && y >= 118 && y <= 182);
 
             if (t_top || t_stem || s_top || s_mid || s_bot || s_ul || s_lr) {
                 r = 255; g = 255; b = 255; /* Bold White "TS" */
@@ -182,31 +204,58 @@ static void generate_ts_icon_png(const char *filepath) {
         }
     }
 
-    uLongf comp_len = compressBound(raw_len);
-    uint8_t *comp = malloc(comp_len);
-    if (!comp) { free(raw); return; }
+    /* Wrap raw scanlines in valid uncompressed zlib stream (RFC 1950/1951) */
+    size_t num_blocks = (raw_len + 65534) / 65535;
+    size_t z_len = 2 + num_blocks * 5 + raw_len + 4;
+    uint8_t *zbuf = malloc(z_len);
+    if (!zbuf) { free(raw); return; }
 
-    if (compress2(comp, &comp_len, raw, raw_len, 9) == Z_OK) {
-        FILE *f = fopen(filepath, "wb");
-        if (f) {
-            const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
-            fwrite(sig, 1, 8, f);
-            uint8_t ihdr[13] = {
-                0, 0, 2, 0, /* 512 */
-                0, 0, 2, 0, /* 512 */
-                8, 2, 0, 0, 0
-            };
-            write_png_chunk(f, "IHDR", ihdr, 13);
-            write_png_chunk(f, "IDAT", comp, (uint32_t)comp_len);
-            write_png_chunk(f, "IEND", NULL, 0);
-            fclose(f);
-        }
+    size_t zpos = 0;
+    zbuf[zpos++] = 0x78;
+    zbuf[zpos++] = 0x01;
+
+    size_t rem = raw_len;
+    size_t rpos = 0;
+    while (rem > 0) {
+        uint16_t blen = (rem > 65535) ? 65535 : (uint16_t)rem;
+        uint8_t final_blk = (rem <= 65535) ? 1 : 0;
+        uint16_t nlen = ~blen;
+        zbuf[zpos++] = final_blk;
+        zbuf[zpos++] = blen & 0xff;
+        zbuf[zpos++] = (blen >> 8) & 0xff;
+        zbuf[zpos++] = nlen & 0xff;
+        zbuf[zpos++] = (nlen >> 8) & 0xff;
+        memcpy(zbuf + zpos, raw + rpos, blen);
+        zpos += blen;
+        rpos += blen;
+        rem -= blen;
     }
-    free(comp);
+
+    uint32_t adler = calc_adler32(raw, raw_len);
+    zbuf[zpos++] = (adler >> 24) & 0xff;
+    zbuf[zpos++] = (adler >> 16) & 0xff;
+    zbuf[zpos++] = (adler >> 8) & 0xff;
+    zbuf[zpos++] = adler & 0xff;
+
+    FILE *f = fopen(filepath, "wb");
+    if (f) {
+        const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+        fwrite(sig, 1, 8, f);
+        uint8_t ihdr[13] = {
+            0, 0, 1, 0, /* 256 */
+            0, 0, 1, 0, /* 256 */
+            8, 2, 0, 0, 0
+        };
+        write_png_chunk(f, "IHDR", ihdr, 13);
+        write_png_chunk(f, "IDAT", zbuf, (uint32_t)zpos);
+        write_png_chunk(f, "IEND", NULL, 0);
+        fclose(f);
+    }
+
+    free(zbuf);
     free(raw);
 }
 
-/* Auto-installs the TabShifter (TBSH00001) App Tile onto the PS5 Home Screen */
 static void ensure_tabshifter_tile_installed(void) {
     mkdir("/user/app/TBSH00001", 0777);
     mkdir("/user/app/TBSH00001/sce_sys", 0777);
@@ -234,7 +283,6 @@ static void ensure_tabshifter_tile_installed(void) {
     if (sqlite3_open(DB_APP_PATH, &db_app) != SQLITE_OK) return;
     if (sqlite3_open(DB_INFO_PATH, &db_info) != SQLITE_OK) { sqlite3_close(db_app); return; }
 
-    /* Check if TBSH00001 already exists in tbl_contentinfo */
     int exists = 0;
     sqlite3_stmt *chk = NULL;
     if (sqlite3_prepare_v2(db_app, "SELECT 1 FROM tbl_contentinfo WHERE titleId='TBSH00001';", -1, &chk, NULL) == SQLITE_OK) {
@@ -248,7 +296,6 @@ static void ensure_tabshifter_tile_installed(void) {
     sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
     sqlite3_exec(db_info, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
 
-    /* Clone a valid template row (e.g. PLDM00001 or any existing row) */
     char *sql_c = sqlite3_mprintf(
         "DELETE FROM tbl_contentinfo WHERE titleId='TBSH00001';"
         "INSERT INTO tbl_contentinfo SELECT 'TBSH00001', contentId, 'TabShifter', '/user/app/TBSH00001/sce_sys', lastAccessTime, contentStatus, contentLocation, ps4parentalLevel, sortPriority, pathInfo, lastAccessIndex+1, 188, uninstallable, ps4contentType, pathInfo2, size, promoteTime, installTime, viewCategory, ps4disableLiveDetail, ps4serviceIdAddCont1, ps4serviceIdAddCont2, ps4serviceIdAddCont3, ps4serviceIdAddCont4, ps4serviceIdAddCont5, ps4serviceIdAddCont6, ps4serviceIdAddCont7, hddLocation, externalHddAppStatus, mTime, sizeOtherHdd, appFormatType, 65536, ps4Attribute, pprAttribute3, pprAttribute4, attributeInternal, conceptId, 'cid:local:TBSH00001', 'http://127.0.0.1:9095/', 'psmediahub:main?titleId=TBSH00001', platform, installStatus, snd0Info, %Q, pic0Info, pic1Info, discStatus, isTitleDiscInserted, pprAgeLevel, 0, primaryTitleSort, bgMatteType, bgImageId, appinfoContentType, contentBadgeType, 1, upgradePs5TitleIdList, packageLocation, "
@@ -405,7 +452,7 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
 
     char *sql_app = sqlite3_mprintf(
         "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, appType = %d, pprHubAppUri = %Q, "
-        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', \%d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', \%Q, '$.APP_TYPE', %d) "
+        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q, '$.APP_TYPE', %d) "
         "WHERE titleId = %Q;"
         "UPDATE tbl_conceptmetadata SET dispLocation = %d, pprHubAppUri = %Q WHERE localConceptId = %Q;"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
@@ -574,4 +621,38 @@ int main(void) {
         if (strncmp(req, "GET /shift?tid=", 15) == 0) {
             char tid[32] = {0};
             int to_media = 0;
-            sscanf(
+            sscanf(req + 15, "%31[^&]&media=%d", tid, &to_media);
+            update_1360_tile(tid, 1, to_media, 0, 1);
+            ps5_notify("Moved %s to %s Tab!", tid, to_media ? "Media" : "Games");
+            restart_sceshellui();
+            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
+        } else if (strncmp(req, "GET /vis?tid=", 13) == 0) {
+            char tid[32] = {0};
+            int v = 0;
+            sscanf(req + 13, "%31[^&]&v=%d", tid, &v);
+            update_1360_tile(tid, 0, 0, 1, v);
+            ps5_notify("%s %s!", v ? "Unhid" : "Hid", tid);
+            restart_sceshellui();
+            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
+        } else if (strncmp(req, "GET /bloat?v=", 13) == 0) {
+            int v = atoi(req + 13);
+            toggle_all_bloatware(v);
+            ps5_notify("%s PSN Bloatware!", v ? "Restored" : "Hid");
+            restart_sceshellui();
+            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
+        } else if (strncmp(req, "GET /restore", 12) == 0) {
+            force_copy_file(DB_INFO_BAK, DB_INFO_PATH);
+            force_copy_file(DB_APP_BAK, DB_APP_PATH);
+            remove_wal_locks();
+            ps5_notify("Restored Original Databases!");
+            restart_sceshellui();
+            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
+        } else {
+            send_dashboard_html(client);
+        }
+        close(client);
+    }
+
+    close(server_fd);
+    return 0;
+}
