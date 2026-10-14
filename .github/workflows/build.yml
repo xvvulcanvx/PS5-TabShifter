@@ -1,0 +1,31 @@
+name: Build PS5 TabShifter Payload
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PS5 Payload SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld wget unzip make
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          sudo mkdir -p /opt/ps5-payload-sdk
+          sudo unzip -q ps5-payload-sdk.zip -d /opt
+
+      - name: Compile TabShifter.elf
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          /opt/ps5-payload-sdk/bin/prospero-clang -O2 main.c -lsqlite3 -lkernel_sys -o TabShifter.elf
+
+      - name: Upload Compiled TabShifter.elf
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabShifter-PS5-13.60
+          path: TabShifter.elf
