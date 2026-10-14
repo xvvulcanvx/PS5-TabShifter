@@ -1,9 +1,9 @@
 /*
- * PS5 TabShifter.elf v1.0 (Native PS5 On-Console Edition for FW 13.60+)
- * - Runs directly on the PS5 (Zero PC required!)
- * - Full Dual-Database 13.60 Engine: patches appinfo.db + app.db (all 4 tables) + param.json
- * - Built-in PS5 TV / Controller Dark-Mode UI on http://127.0.0.1:9095
- * - Native SceShellUI SIGKILL auto-refresh in 1.5 seconds
+ * PS5 TabShifter.elf v1.0 (Standalone On-Console Edition for FW 13.60+)
+ * - Auto-generates custom 512x512 "TS" icon0.png & installs the TabShifter Home Screen Tile
+ * - Moves any game/homebrew app between Games & Media tabs (appinfo.db + app.db + param.json)
+ * - Hides/Restores dead PSN Bloatware (PS Store, PS Plus, Remote Play, Share Play)
+ * - Instant SceShellUI hot-reload in 1.5s
  */
 
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -19,6 +20,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <zlib.h>
 #include <sqlite3.h>
 
 #define PORT 9095
@@ -28,7 +30,6 @@
 #define DB_APP_BAK   "/system_data/priv/mms/app.db.tabshifter.bak"
 #define DB_INFO_BAK  "/system_data/priv/mms/appinfo.db.tabshifter.bak"
 
-/* Exact FW 13.60 Constants */
 #define DISP_GAME   138
 #define DISP_MEDIA  188
 #define DISP_HIDDEN 0
@@ -59,7 +60,6 @@ static void ps5_notify(const char *fmt, ...) {
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
 }
 
-/* Native PS5 Kernel Process Scanner: Finds SceShellUI and sends SIGKILL for instant 1.5s UI reload */
 static int restart_sceshellui(void) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0 };
     size_t buf_size = 0;
@@ -134,7 +134,165 @@ static void backup_databases_once(void) {
     copy_file_if_missing(DB_INFO_PATH, DB_INFO_BAK);
 }
 
-/* Patches applicationCategoryType in param.json on disk so changes survive database rebuilds */
+/* Helper to write big-endian 32-bit integers & PNG chunks */
+static void write_be32(FILE *f, uint32_t val) {
+    uint8_t b[4] = { (val >> 24) & 0xff, (val >> 16) & 0xff, (val >> 8) & 0xff, val & 0xff };
+    fwrite(b, 1, 4, f);
+}
+
+static void write_png_chunk(FILE *f, const char type[4], const uint8_t *data, uint32_t len) {
+    write_be32(f, len);
+    fwrite(type, 1, 4, f);
+    if (len > 0 && data) fwrite(data, 1, len, f);
+    uint32_t crc = crc32(0L, Z_NULL, 0);
+    crc = crc32(crc, (const Bytef *)type, 4);
+    if (len > 0 && data) crc = crc32(crc, (const Bytef *)data, len);
+    write_be32(f, crc);
+}
+
+/* Generates a crisp 512x512 "TS" PNG icon natively in C */
+static void generate_ts_icon_png(const char *filepath) {
+    const int w = 512, h = 512;
+    size_t raw_len = (size_t)h * (1 + w * 3);
+    uint8_t *raw = malloc(raw_len);
+    if (!raw) return;
+
+    size_t idx = 0;
+    for (int y = 0; y < h; y++) {
+        raw[idx++] = 0; /* Filter type 0 */
+        for (int x = 0; x < w; x++) {
+            uint8_t r = 12, g = 16, b = 28;
+            if (x < 18 || x >= w - 18 || y < 18 || y >= h - 18) {
+                r = 37; g = 99; b = 235; /* Neon Blue Border */
+            }
+            int t_top  = (x >= 95  && x <= 245 && y >= 150 && y <= 195);
+            int t_stem = (x >= 148 && x <= 192 && y >= 150 && y <= 365);
+            int s_top  = (x >= 275 && x <= 415 && y >= 150 && y <= 192);
+            int s_mid  = (x >= 275 && x <= 415 && y >= 236 && y <= 278);
+            int s_bot  = (x >= 275 && x <= 415 && y >= 323 && y <= 365);
+            int s_ul   = (x >= 275 && x <= 318 && y >= 150 && y <= 278);
+            int s_lr   = (x >= 372 && x <= 415 && y >= 236 && y <= 365);
+
+            if (t_top || t_stem || s_top || s_mid || s_bot || s_ul || s_lr) {
+                r = 255; g = 255; b = 255; /* Bold White "TS" */
+            }
+            raw[idx++] = r;
+            raw[idx++] = g;
+            raw[idx++] = b;
+        }
+    }
+
+    uLongf comp_len = compressBound(raw_len);
+    uint8_t *comp = malloc(comp_len);
+    if (!comp) { free(raw); return; }
+
+    if (compress2(comp, &comp_len, raw, raw_len, 9) == Z_OK) {
+        FILE *f = fopen(filepath, "wb");
+        if (f) {
+            const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+            fwrite(sig, 1, 8, f);
+            uint8_t ihdr[13] = {
+                0, 0, 2, 0, /* 512 */
+                0, 0, 2, 0, /* 512 */
+                8, 2, 0, 0, 0
+            };
+            write_png_chunk(f, "IHDR", ihdr, 13);
+            write_png_chunk(f, "IDAT", comp, (uint32_t)comp_len);
+            write_png_chunk(f, "IEND", NULL, 0);
+            fclose(f);
+        }
+    }
+    free(comp);
+    free(raw);
+}
+
+/* Auto-installs the TabShifter (TBSH00001) App Tile onto the PS5 Home Screen */
+static void ensure_tabshifter_tile_installed(void) {
+    mkdir("/user/app/TBSH00001", 0777);
+    mkdir("/user/app/TBSH00001/sce_sys", 0777);
+
+    generate_ts_icon_png("/user/app/TBSH00001/sce_sys/icon0.png");
+
+    FILE *pf = fopen("/user/app/TBSH00001/sce_sys/param.json", "wb");
+    if (pf) {
+        const char *pjson =
+            "{\n"
+            "  \"titleId\": \"TBSH00001\",\n"
+            "  \"applicationCategoryType\": 65536,\n"
+            "  \"deeplinkUri\": \"http://127.0.0.1:9095/\",\n"
+            "  \"localizedParameters\": {\n"
+            "    \"defaultLanguage\": \"en-US\",\n"
+            "    \"en-US\": { \"titleName\": \"TabShifter\" }\n"
+            "  }\n"
+            "}\n";
+        fwrite(pjson, 1, strlen(pjson), pf);
+        fclose(pf);
+    }
+
+    sqlite3 *db_app = NULL;
+    sqlite3 *db_info = NULL;
+    if (sqlite3_open(DB_APP_PATH, &db_app) != SQLITE_OK) return;
+    if (sqlite3_open(DB_INFO_PATH, &db_info) != SQLITE_OK) { sqlite3_close(db_app); return; }
+
+    /* Check if TBSH00001 already exists in tbl_contentinfo */
+    int exists = 0;
+    sqlite3_stmt *chk = NULL;
+    if (sqlite3_prepare_v2(db_app, "SELECT 1 FROM tbl_contentinfo WHERE titleId='TBSH00001';", -1, &chk, NULL) == SQLITE_OK) {
+        if (sqlite3_step(chk) == SQLITE_ROW) exists = 1;
+        sqlite3_finalize(chk);
+    }
+
+    char icon_uri[128];
+    snprintf(icon_uri, sizeof(icon_uri), "/user/app/TBSH00001/sce_sys/icon0.png?ts=%ld", (long)time(NULL));
+
+    sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+    sqlite3_exec(db_info, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+
+    /* Clone a valid template row (e.g. PLDM00001 or any existing row) */
+    char *sql_c = sqlite3_mprintf(
+        "DELETE FROM tbl_contentinfo WHERE titleId='TBSH00001';"
+        "INSERT INTO tbl_contentinfo SELECT 'TBSH00001', contentId, 'TabShifter', '/user/app/TBSH00001/sce_sys', lastAccessTime, contentStatus, contentLocation, ps4parentalLevel, sortPriority, pathInfo, lastAccessIndex+1, 188, uninstallable, ps4contentType, pathInfo2, size, promoteTime, installTime, viewCategory, ps4disableLiveDetail, ps4serviceIdAddCont1, ps4serviceIdAddCont2, ps4serviceIdAddCont3, ps4serviceIdAddCont4, ps4serviceIdAddCont5, ps4serviceIdAddCont6, ps4serviceIdAddCont7, hddLocation, externalHddAppStatus, mTime, sizeOtherHdd, appFormatType, 65536, ps4Attribute, pprAttribute3, pprAttribute4, attributeInternal, conceptId, 'cid:local:TBSH00001', 'http://127.0.0.1:9095/', 'psmediahub:main?titleId=TBSH00001', platform, installStatus, snd0Info, %Q, pic0Info, pic1Info, discStatus, isTitleDiscInserted, pprAgeLevel, 0, primaryTitleSort, bgMatteType, bgImageId, appinfoContentType, contentBadgeType, 1, upgradePs5TitleIdList, packageLocation, "
+        "json_set(AppInfoJson, '$.TITLE', 'TabShifter', '$.TITLE_01', 'TabShifter', '$.TITLE_ID', 'TBSH00001', '$.DISPLAYLOCATION', 188, '$.CATEGORY_TYPE', 65536, '$.DEEPLINK_URI', 'http://127.0.0.1:9095/', '$.HUBAPP_URI', 'psmediahub:main?titleId=TBSH00001', '$._local_concept_id', 'cid:local:TBSH00001', '$._metadata_path', '/user/app/TBSH00001/sce_sys', '$._org_path', '/user/app/TBSH00001') "
+        "FROM tbl_contentinfo WHERE titleId='PLDM00001' LIMIT 1;", icon_uri);
+    sqlite3_exec(db_app, sql_c, NULL, NULL, NULL);
+    sqlite3_free(sql_c);
+
+    sqlite3_stmt *ust = NULL;
+    char user_ids[16][32];
+    int ucount = 0;
+    if (sqlite3_prepare_v2(db_app, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';", -1, &ust, NULL) == SQLITE_OK) {
+        while (sqlite3_step(ust) == SQLITE_ROW && ucount < 16) {
+            const char *tname = (const char *)sqlite3_column_text(ust, 0);
+            if (tname && strlen(tname) > 13) strncpy(user_ids[ucount++], tname + 13, 31);
+        }
+        sqlite3_finalize(ust);
+    }
+
+    for (int i = 0; i < ucount; i++) {
+        char *usql = sqlite3_mprintf(
+            "DELETE FROM tbl_iconinfo_%s WHERE titleId='TBSH00001';"
+            "INSERT INTO tbl_iconinfo_%s SELECT 'TBSH00001', 'TabShifter', 'cid:local:TBSH00001', conceptId, lastAccessTime, lastAccessIndex+1, lastPlayedDate, lastPlayedIndex, lastPlayedDateOnConsole, playedTimeOnConsole, recentActivityDatePlayedOrPurchased, recentActivityDatePlayedOrInstalled, installedDate, installStatus, pinnedStatus, 188, 1, externalLaunchFlag, psNowFlag, 'http://127.0.0.1:9095/', 'psmediahub:main?titleId=TBSH00001', platform, appDrmType, betaFlag, contentBadgeType, isVr, primaryTitleSort, discStatus, lastLaunchMethod, contentId, utmLocalConceptId, utmConceptId, utmCatalogConceptId, utmTitleName, utmPlatform, utmEstimatedSize, utmIconUrl, utmBgImageUrl, utmAgeLevel, utmType, utmSpaceType, utmDrmType, utmContentBadgeType, utmAttribute, utmRevisionId, utmScpDataStored, entEntitlement, entConceptId, entLastUpdateTime, entPlayabilityDate, entContentType, entSkuId, entPrimaryParentStatus, entRelatedTitles1, entRelatedTitles2, entRelatedTitles3, entRelatedTitles4, entRelatedTitles5, entRelatedTitles6, entRelatedTitles7, entActiveDate, entId, entFreePsPlusContent, entActiveFlag, entHidden, entPurchasedDate, entStatusType, entFilTypeEnt, entUniId, entUniActiveFlag, entUniRewardMembershipType, entUniFeatureType, entStrId, entStrActiveFlag, entStrStatusType, entStrRewardMembershipType, entStrFeatureType, entStrSkuId, entStrFreePsPlusContent, entPreorderPlaceholderFlag, entGatingEntitlementJson, gltlastPlayedDate, gltTotalPlayedTime, gltConceptId, gltPlayCount, gltCategory, emsPushedFlag, emsDeletedFlag FROM tbl_iconinfo_%s WHERE titleId='PLDM00001' LIMIT 1;"
+            "DELETE FROM tbl_concepticoninfo_%s WHERE primaryTitleId='TBSH00001';"
+            "INSERT INTO tbl_concepticoninfo_%s SELECT 'cid:local:TBSH00001', 1, conceptId, 'TabShifter', lastAccessIndex+1, lastPlayedDate, lastPlayedDateOnConsole, totalPlayedTime, 'TBSH00001', 'TabShifter', primaryTitlePlatform, primaryTitleBgMatteType, lastInteractedTime, lastModifiedToNotifyEvent, 2236, filterTypeEntitlement, totalEstimatedSize, purchasedDate, promoteTime, psNowFlag, 'http://127.0.0.1:9095/', 'psmediahub:main?titleId=TBSH00001', '/user/app/TBSH00001/sce_sys', %Q, pic0Info, snd0Info, classicGamePlatform, minimumAge, publisherName, descriptions, type, genres, genreFlags, spaceType, ucmConceptId, ucmIcon0Info, ucmPic0Info, ucmLogoUrl, ucmClassicGamePlatform, ucmMinimumAge, ucmPublisherName, ucmDescriptions, ucmType, ucmGenres, ucmSpaceType, ucmScpDataStored, 'TabShifter' FROM tbl_concepticoninfo_%s WHERE primaryTitleId='PLDM00001' LIMIT 1;",
+            user_ids[i], user_ids[i], user_ids[i], user_ids[i], user_ids[i], icon_uri, user_ids[i]);
+        sqlite3_exec(db_app, usql, NULL, NULL, NULL);
+        sqlite3_free(usql);
+    }
+
+    const char *isql =
+        "DELETE FROM tbl_appinfo WHERE titleId='TBSH00001';"
+        "INSERT INTO tbl_appinfo SELECT 'TBSH00001', metaDataId, key, CASE WHEN key IN ('TITLE','TITLE_01') THEN 'TabShifter' WHEN key='TITLE_ID' THEN 'TBSH00001' WHEN key='DEEPLINK_URI' THEN 'http://127.0.0.1:9095/' WHEN key='HUBAPP_URI' THEN 'psmediahub:main?titleId=TBSH00001' WHEN key='_local_concept_id' THEN 'cid:local:TBSH00001' WHEN key='_metadata_path' THEN '/user/app/TBSH00001/sce_sys' WHEN key='_org_path' THEN '/user/app/TBSH00001' ELSE val END FROM tbl_appinfo WHERE titleId='PLDM00001';";
+    sqlite3_exec(db_info, isql, NULL, NULL, NULL);
+
+    sqlite3_close(db_info);
+    sqlite3_close(db_app);
+    remove_wal_locks();
+
+    if (!exists) {
+        restart_sceshellui();
+    }
+}
+
 static void patch_param_json_on_disk(const char *tid, int cat_type) {
     const char *paths[3] = {
         "/user/app/%s/sce_sys/param.json",
@@ -178,7 +336,6 @@ static void patch_param_json_on_disk(const char *tid, int cat_type) {
     }
 }
 
-/* Core FW 13.60 Dual-DB Updater: Updates appinfo.db + app.db (all 4 tables) + param.json */
 static void update_1360_tile(const char *tid, int change_tab, int to_media, int change_vis, int visible) {
     sqlite3 *db_app = NULL;
     sqlite3 *db_info = NULL;
@@ -192,7 +349,6 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
     sqlite3_exec(db_info, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
 
-    /* Fetch current values & localConceptId from tbl_contentinfo */
     char local_cid[128] = {0};
     int curr_disp = DISP_GAME;
     int curr_cat = CAT_GAME;
@@ -234,7 +390,6 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
         else if (strcmp(tid, "NPXS40074") == 0 || strcmp(tid, "NPXS40099") == 0) { disp_loc = 155; concept_disp = 2203; }
     }
 
-    /* 1. Update appinfo.db (tbl_appinfo & tbl_conceptinfo) */
     char *sql_info = sqlite3_mprintf(
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'DISPLAYLOCATION';"
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'CATEGORY_TYPE';"
@@ -248,10 +403,9 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     sqlite3_exec(db_info, sql_info, NULL, NULL, NULL);
     sqlite3_free(sql_info);
 
-    /* 2. Update app.db (tbl_contentinfo & tbl_conceptmetadata) */
     char *sql_app = sqlite3_mprintf(
         "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, appType = %d, pprHubAppUri = %Q, "
-        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q, '$.APP_TYPE', %d) "
+        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', \%d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', \%Q, '$.APP_TYPE', %d) "
         "WHERE titleId = %Q;"
         "UPDATE tbl_conceptmetadata SET dispLocation = %d, pprHubAppUri = %Q WHERE localConceptId = %Q;"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
@@ -261,16 +415,13 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     sqlite3_exec(db_app, sql_app, NULL, NULL, NULL);
     sqlite3_free(sql_app);
 
-    /* 3. Dynamically iterate all per-user tables (tbl_iconinfo_<UID> & tbl_concepticoninfo_<UID>) */
     sqlite3_stmt *ust = NULL;
     char user_ids[16][32];
     int ucount = 0;
     if (sqlite3_prepare_v2(db_app, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';", -1, &ust, NULL) == SQLITE_OK) {
         while (sqlite3_step(ust) == SQLITE_ROW && ucount < 16) {
             const char *tname = (const char *)sqlite3_column_text(ust, 0);
-            if (tname && strlen(tname) > 13) {
-                strncpy(user_ids[ucount++], tname + 13, 31);
-            }
+            if (tname && strlen(tname) > 13) strncpy(user_ids[ucount++], tname + 13, 31);
         }
         sqlite3_finalize(ust);
     }
@@ -315,7 +466,6 @@ static int is_bloat_id(const char *tid) {
     return 0;
 }
 
-/* Renders the PS5 Controller-Friendly Dark-Mode UI on Port 9095 */
 static void send_dashboard_html(int client_fd) {
     const char *header =
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
@@ -395,6 +545,7 @@ static void send_dashboard_html(int client_fd) {
 
 int main(void) {
     backup_databases_once();
+    ensure_tabshifter_tile_installed();
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -406,12 +557,12 @@ int main(void) {
     addr.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        ps5_notify("TabShifter Error: Port %d already in use!", PORT);
-        return 1;
+        ps5_notify("TabShifter already active on Port %d!", PORT);
+        return 0;
     }
 
     listen(server_fd, 5);
-    ps5_notify("PS5 TabShifter v1.0 Ready!\nOpen http://<PS5_IP>:%d", PORT);
+    ps5_notify("PS5 TabShifter v1.0 Active!\nLaunch TabShifter from your Media Tab!");
 
     while (g_running) {
         int client = accept(server_fd, NULL, NULL);
@@ -423,38 +574,4 @@ int main(void) {
         if (strncmp(req, "GET /shift?tid=", 15) == 0) {
             char tid[32] = {0};
             int to_media = 0;
-            sscanf(req + 15, "%31[^&]&media=%d", tid, &to_media);
-            update_1360_tile(tid, 1, to_media, 0, 1);
-            ps5_notify("Moved %s to %s Tab!", tid, to_media ? "Media" : "Games");
-            restart_sceshellui();
-            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
-        } else if (strncmp(req, "GET /vis?tid=", 13) == 0) {
-            char tid[32] = {0};
-            int v = 0;
-            sscanf(req + 13, "%31[^&]&v=%d", tid, &v);
-            update_1360_tile(tid, 0, 0, 1, v);
-            ps5_notify("%s %s!", v ? "Unhid" : "Hid", tid);
-            restart_sceshellui();
-            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
-        } else if (strncmp(req, "GET /bloat?v=", 13) == 0) {
-            int v = atoi(req + 13);
-            toggle_all_bloatware(v);
-            ps5_notify("%s PSN Bloatware!", v ? "Restored" : "Hid");
-            restart_sceshellui();
-            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
-        } else if (strncmp(req, "GET /restore", 12) == 0) {
-            force_copy_file(DB_INFO_BAK, DB_INFO_PATH);
-            force_copy_file(DB_APP_BAK, DB_APP_PATH);
-            remove_wal_locks();
-            ps5_notify("Restored Original Databases!");
-            restart_sceshellui();
-            write(client, "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n", 35);
-        } else {
-            send_dashboard_html(client);
-        }
-        close(client);
-    }
-
-    close(server_fd);
-    return 0;
-}
+            sscanf(
