@@ -1,12 +1,15 @@
 /*
- * PS5 TabShifter.elf v1.3 (Audited Production Release for FW 13.60+)
+ * PS5 TabShifter.elf v1.1.0 (FW 12.xx / 13.00 / 13.40 / 13.60 Edition)
  *
- * Verified against ps5-payload-dev/ftpsrv, itsPLK/ps5-payload-manager, and ps5-payload-dev/sdk:
- *  - Linked with -lSceIpmi before -lSceAppInstUtil (fixes ps5-payload-dev/sdk Issue #26 startup abort)
- *  - Uses pure sceAppInstUtilAppInstallTitleDir("TBSH00001", "/user/app/", 0) + sceAppInstUtilTerminate()
- *    so the "TS" Home Screen tile is 100% natively deletable via PS5 Controller (Options -> Delete)
- *  - Ignores SIGPIPE so PS5 browser navigation never terminates the background HTTP server
- *  - Uses sqlite3_busy_timeout(3000) and syncs all 4 tables in app.db + appinfo.db + param.json
+ * Changelog in v1.1.0 (Community Feedback Update):
+ *  1. FIXED PADLOCKS: Preserves each game's native appType (1 vs 5), stops modifying game param.json
+ *     files on disk, and removes sceAppInstUtilAppInstallAll(0) so fpkg/dumped games never get padlocked.
+ *  2. FIXED 12.02 COMPATIBILITY: Safely skips missing Title IDs and prevents empty localConceptId matches.
+ *  3. REBOOT-PERSISTENT BLOATWARE HIDING: Uses Sony's native hidden dispLocation (1) + visible=0/validFlag=0.
+ *  4. PSGFX SYSTEM TILES: Exposes Media Gallery, Disc Player, Music Home, Discover, Welcome, and All Apps
+ *     for individual hiding while keeping Welcome Hub untouched during 1-click PSN Bloatware sweeps.
+ *  5. MORE TILES ON MAIN SCREEN: Added "Pin All Games to Main Screen" to set pinnedStatus=1 and boost
+ *     lastAccessIndex so installed games stay on the main Home Screen bar instead of dropping into Library.
  */
 
 #include <stdio.h>
@@ -35,14 +38,14 @@
 #define DB_APP_BAK   "/system_data/priv/mms/app.db.tabshifter.bak"
 #define DB_INFO_BAK  "/system_data/priv/mms/appinfo.db.tabshifter.bak"
 
-/* Firmware 13.60 Display & Category Constants */
+/* Display & Category Constants */
 #define DISP_GAME   138
 #define DISP_MEDIA  188
-#define DISP_HIDDEN 0
+#define DISP_HIDDEN 1   /* Sony native hidden state (matches NPXS40106 Game Streaming) */
 
 #define CONCEPT_DISP_GAME   1162
 #define CONCEPT_DISP_MEDIA  2236
-#define CONCEPT_DISP_HIDDEN 0
+#define CONCEPT_DISP_HIDDEN 1
 
 #define CAT_GAME  0
 #define CAT_MEDIA 65536
@@ -55,7 +58,6 @@ typedef struct notify_request {
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilTerminate(void);
-int sceAppInstUtilAppInstallAll(void*);
 int sceAppInstUtilAppUnInstall(const char*);
 
 static volatile int g_running = 1;
@@ -185,7 +187,6 @@ static void write_png_chunk(FILE *f, const char type[4], const uint8_t *data, ui
     free(crc_buf);
 }
 
-/* Generates a 512x512 24-bit RGB PNG with "TS" logo (matches Sony's 512x512 icon0.png spec) */
 static int generate_ts_icon_png(const char *filepath) {
     const int w = 512, h = 512;
     size_t raw_len = (size_t)h * (1 + w * 3);
@@ -270,17 +271,12 @@ static int generate_ts_icon_png(const char *filepath) {
 }
 
 /*
- * Exact Home Screen Launcher Installation Pattern from ps5-payload-dev/ftpsrv/install-ps5.c
- * and itsPLK/ps5-payload-manager:
- *  1. Initializes SceAppInstUtil
- *  2. Writes /user/app/TBSH00001/sce_sys/icon0.png & param.json
- *  3. Calls sceAppInstUtilAppInstallTitleDir("TBSH00001", "/user/app/", 0)
- *  4. Calls sceAppInstUtilTerminate()
- * This registers TBSH00001 natively with SceShellCore so Options -> Delete works from the PS5 UI!
+ * Safe Home Screen Launcher Installer:
+ * Uses ONLY sceAppInstUtilAppInstallTitleDir (NEVER calls sceAppInstUtilAppInstallAll,
+ * which caused the OS license check padlocks on fpkg games).
  */
 static int install_tabshifter_launcher(int force_reinstall) {
     if (!force_reinstall && access("/user/app/" TITLE_ID "/sce_sys/param.json", F_OK) == 0) {
-        /* Already installed on disk; just refresh icon0.png if needed */
         generate_ts_icon_png("/user/app/" TITLE_ID "/sce_sys/icon0.png");
         return 0;
     }
@@ -288,8 +284,6 @@ static int install_tabshifter_launcher(int force_reinstall) {
     if (sceAppInstUtilInitialize() != 0) {
         return -1;
     }
-
-    sceAppInstUtilAppUnInstall(TITLE_ID);
 
     mkdir("/user/app/" TITLE_ID, 0755);
     mkdir("/user/app/" TITLE_ID "/sce_sys", 0755);
@@ -326,15 +320,13 @@ static int install_tabshifter_launcher(int force_reinstall) {
     int err = -1;
     if (sceAppInstUtilAppInstallTitleDir) {
         err = sceAppInstUtilAppInstallTitleDir(TITLE_ID, "/user/app/", 0);
-    } else {
-        err = sceAppInstUtilAppInstallAll(0);
     }
+    /* Note: Never call sceAppInstUtilAppInstallAll(0) here, as it triggers fpkg license padlocks */
 
     sceAppInstUtilTerminate();
     return err;
 }
 
-/* Native Uninstaller: Calls sceAppInstUtilAppUnInstall("TBSH00001") + cleans /user/app/TBSH00001 */
 static void uninstall_tabshifter_launcher(void) {
     if (sceAppInstUtilInitialize() == 0) {
         sceAppInstUtilAppUnInstall(TITLE_ID);
@@ -347,50 +339,6 @@ static void uninstall_tabshifter_launcher(void) {
     rmdir("/user/app/" TITLE_ID);
 }
 
-static void patch_param_json_on_disk(const char *tid, int cat_type) {
-    const char *paths[3] = {
-        "/user/app/%s/sce_sys/param.json",
-        "/user/appmeta/%s/param.json",
-        "/system_data/priv/appmeta/%s/param.json"
-    };
-
-    for (int i = 0; i < 3; i++) {
-        char path[256];
-        snprintf(path, sizeof(path), paths[i], tid);
-        FILE *f = fopen(path, "rb");
-        if (!f) continue;
-
-        fseek(f, 0, SEEK_END);
-        long len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (len <= 0 || len > 512 * 1024) { fclose(f); continue; }
-
-        char *json = malloc(len + 64);
-        if (!json) { fclose(f); continue; }
-        fread(json, 1, len, f);
-        json[len] = '\0';
-        fclose(f);
-
-        char *pos = strstr(json, "\"applicationCategoryType\"");
-        if (pos) {
-            char *colon = strchr(pos, ':');
-            if (colon) {
-                FILE *out = fopen(path, "wb");
-                if (out) {
-                    fwrite(json, 1, (colon - json) + 1, out);
-                    fprintf(out, " %d", cat_type);
-                    char *end = colon + 1;
-                    while (*end == ' ' || (*end >= '0' && *end <= '9')) end++;
-                    fwrite(end, 1, strlen(end), out);
-                    fclose(out);
-                }
-            }
-        }
-        free(json);
-    }
-}
-
-/* Helper to update display_location & hubapp_uri inside tbl_conceptmetadata.ConceptInfoJson */
 static void update_concept_info_json(sqlite3 *db_app, const char *local_cid, int disp_loc, const char *hub_uri) {
     if (!local_cid || !local_cid[0]) return;
     sqlite3_stmt *st = NULL;
@@ -399,10 +347,8 @@ static void update_concept_info_json(sqlite3 *db_app, const char *local_cid, int
         if (sqlite3_step(st) == SQLITE_ROW) {
             const char *raw = (const char *)sqlite3_column_text(st, 0);
             if (raw) {
-                /* Update display_location data value inside field_list */
                 char *dl_pos = strstr(raw, "\"key\":\"display_location\"");
                 if (dl_pos) {
-                    /* Walk backward to "data": */
                     char *data_pos = dl_pos;
                     while (data_pos > raw && strncmp(data_pos, "\"data\":", 7) != 0) data_pos--;
                     if (strncmp(data_pos, "\"data\":", 7) == 0) {
@@ -430,6 +376,13 @@ static void update_concept_info_json(sqlite3 *db_app, const char *local_cid, int
     sqlite3_free(q);
 }
 
+/*
+ * Core Tile Updater (v1.1.0):
+ * - Preserves each game's original appType (1 for PS5 games, 5 for homebrew) when moving back to Games
+ *   so games NEVER get padlocked!
+ * - Skips missing Title IDs safely so 12.02 / 13.00 / 13.40 consoles never match empty localConceptIds.
+ * - Does not touch game param.json files on disk (prevents "Ongoing" / corrupted param.json lockouts).
+ */
 static void update_1360_tile(const char *tid, int change_tab, int to_media, int change_vis, int visible) {
     sqlite3 *db_app = NULL;
     sqlite3 *db_info = NULL;
@@ -450,20 +403,33 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     int curr_disp = DISP_GAME;
     int curr_cat = CAT_GAME;
     int curr_video = 0;
+    int curr_apptype = 1;
+    int curr_concept_id = 0;
+    int row_found = 0;
 
     sqlite3_stmt *st = NULL;
-    char *q = sqlite3_mprintf("SELECT dispLocation, categoryType, is3rdPartyVideoApp, localConceptId FROM tbl_contentinfo WHERE titleId = %Q;", tid);
+    char *q = sqlite3_mprintf("SELECT dispLocation, categoryType, is3rdPartyVideoApp, appType, conceptId, localConceptId FROM tbl_contentinfo WHERE titleId = %Q;", tid);
     if (sqlite3_prepare_v2(db_app, q, -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) {
+            row_found = 1;
             curr_disp = sqlite3_column_int(st, 0);
             curr_cat = sqlite3_column_int(st, 1);
             curr_video = sqlite3_column_int(st, 2);
-            const char *cid_txt = (const char *)sqlite3_column_text(st, 3);
+            curr_apptype = sqlite3_column_int(st, 3);
+            curr_concept_id = sqlite3_column_int(st, 4);
+            const char *cid_txt = (const char *)sqlite3_column_text(st, 5);
             if (cid_txt) strncpy(local_cid, cid_txt, sizeof(local_cid) - 1);
         }
         sqlite3_finalize(st);
     }
     sqlite3_free(q);
+
+    /* If this titleId does not exist on this console/firmware, abort safely! */
+    if (!row_found) {
+        sqlite3_close(db_info);
+        sqlite3_close(db_app);
+        return;
+    }
 
     int is_media = change_tab ? to_media : ((curr_disp == DISP_MEDIA) || (curr_cat == CAT_MEDIA) || (curr_video == 1));
     int is_vis   = change_vis ? visible : (curr_disp > 1);
@@ -472,8 +438,22 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     int concept_disp = is_media ? CONCEPT_DISP_MEDIA : CONCEPT_DISP_GAME;
     int cat_type     = is_media ? CAT_MEDIA : CAT_GAME;
     int is_video     = is_media ? 1 : 0;
-    int app_type_val = is_media ? 0 : 5;
     int vis_flag     = is_vis ? 1 : 0;
+
+    /* Preserve original appType! Only set 0 when moving to Media; restore 1 for retail/fpkg games or 5 for homebrew */
+    int app_type_val = curr_apptype;
+    if (change_tab) {
+        if (is_media) {
+            app_type_val = 0;
+        } else {
+            /* Native PS5 games have conceptId > 0 and start with PPSA/CUSA -> appType 1 */
+            if (strncmp(tid, "PPSA", 4) == 0 && curr_concept_id > 0 && strncmp(tid, "PPSA99", 6) != 0) {
+                app_type_val = 1;
+            } else {
+                app_type_val = (curr_apptype > 0) ? curr_apptype : 5;
+            }
+        }
+    }
 
     char hub_uri[128];
     snprintf(hub_uri, sizeof(hub_uri), is_media ? "psmediahub:main?titleId=%s" : "pshome:gamehub?titleId=%s", tid);
@@ -481,10 +461,15 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     if (!is_vis) {
         disp_loc = DISP_HIDDEN;
         concept_disp = CONCEPT_DISP_HIDDEN;
-    } else {
-        if (strcmp(tid, "NPXS40037") == 0) { disp_loc = 147; concept_disp = 2195; }
-        else if (strcmp(tid, "NPXS40047") == 0) { disp_loc = 146; concept_disp = 2194; }
+    } else if (!change_tab && strncmp(tid, "NPXS", 4) == 0) {
+        /* Restore native system dispLocations when unhiding system apps */
+        if (strcmp(tid, "NPXS40037") == 0 || strcmp(tid, "NPXS40063") == 0) { disp_loc = 147; concept_disp = 2195; }
+        else if (strcmp(tid, "NPXS40047") == 0 || strcmp(tid, "NPXS40071") == 0) { disp_loc = 146; concept_disp = 2194; }
         else if (strcmp(tid, "NPXS40074") == 0 || strcmp(tid, "NPXS40099") == 0) { disp_loc = 155; concept_disp = 2203; }
+        else if (strcmp(tid, "NPXS40075") == 0) { disp_loc = 154; concept_disp = 2202; }
+        else if (strcmp(tid, "NPXS40140") == 0) { disp_loc = 157; concept_disp = 2205; }
+        else if (strcmp(tid, "NPXS40053") == 0 || strcmp(tid, "NPXS40054") == 0 || strcmp(tid, "NPXS40305") == 0) { disp_loc = 149; concept_disp = 2197; }
+        else if (strcmp(tid, "NPXS40056") == 0 || strcmp(tid, "NPXS40139") == 0) { disp_loc = 148; concept_disp = 2196; }
     }
 
     char *sql_info = sqlite3_mprintf(
@@ -492,27 +477,33 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'CATEGORY_TYPE';"
         "UPDATE tbl_appinfo SET val = %Q WHERE titleId = %Q AND key = 'HUBAPP_URI';"
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'APP_TYPE';"
-        "UPDATE tbl_conceptinfo SET val = %d WHERE local_concept_id = %Q AND key = 'display_location';"
-        "UPDATE tbl_conceptinfo SET val = %Q WHERE local_concept_id = %Q AND key = 'hubapp_uri';"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
-        disp_loc, tid, cat_type, tid, hub_uri, tid, app_type_val, tid,
-        disp_loc, local_cid, hub_uri, local_cid);
+        disp_loc, tid, cat_type, tid, hub_uri, tid, app_type_val, tid);
     sqlite3_exec(db_info, sql_info, NULL, NULL, NULL);
     sqlite3_free(sql_info);
+
+    if (strlen(local_cid) > 0) {
+        char *sql_cinfo = sqlite3_mprintf(
+            "UPDATE tbl_conceptinfo SET val = %d WHERE local_concept_id = %Q AND key = 'display_location';"
+            "UPDATE tbl_conceptinfo SET val = %Q WHERE local_concept_id = %Q AND key = 'hubapp_uri';",
+            disp_loc, local_cid, hub_uri, local_cid);
+        sqlite3_exec(db_info, sql_cinfo, NULL, NULL, NULL);
+        sqlite3_free(sql_cinfo);
+    }
 
     char *sql_app = sqlite3_mprintf(
         "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, appType = %d, pprHubAppUri = %Q, "
         "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q, '$.APP_TYPE', %d) "
         "WHERE titleId = %Q;"
-        "UPDATE tbl_conceptmetadata SET dispLocation = %d, pprHubAppUri = %Q WHERE localConceptId = %Q;"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
         disp_loc, cat_type, is_video, app_type_val, hub_uri,
-        disp_loc, cat_type, hub_uri, app_type_val, tid,
-        disp_loc, hub_uri, local_cid);
+        disp_loc, cat_type, hub_uri, app_type_val, tid);
     sqlite3_exec(db_app, sql_app, NULL, NULL, NULL);
     sqlite3_free(sql_app);
 
-    update_concept_info_json(db_app, local_cid, disp_loc, hub_uri);
+    if (strlen(local_cid) > 0) {
+        update_concept_info_json(db_app, local_cid, disp_loc, hub_uri);
+    }
 
     sqlite3_stmt *ust = NULL;
     char user_ids[16][32];
@@ -526,16 +517,28 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     }
 
     for (int i = 0; i < ucount; i++) {
-        char *usql = sqlite3_mprintf(
-            "UPDATE tbl_iconinfo_%s SET dispLocation = %d, visible = %d, hubAppUri = %Q WHERE titleId = %Q;"
-            "UPDATE tbl_concepticoninfo_%s SET dispLocation = %d, validFlag = %d, hubAppUri = %Q WHERE primaryTitleId = %Q OR localConceptId = %Q;",
-            user_ids[i], disp_loc, vis_flag, hub_uri, tid,
-            user_ids[i], concept_disp, vis_flag, hub_uri, tid, local_cid);
+        char *usql = NULL;
+        if (strlen(local_cid) > 0) {
+            usql = sqlite3_mprintf(
+                "UPDATE tbl_iconinfo_%s SET dispLocation = %d, visible = %d, hubAppUri = %Q, emsDeletedFlag = %d WHERE titleId = %Q;"
+                "UPDATE tbl_concepticoninfo_%s SET dispLocation = %d, validFlag = %d, hubAppUri = %Q WHERE primaryTitleId = %Q OR localConceptId = %Q;",
+                user_ids[i], disp_loc, vis_flag, hub_uri, is_vis ? 0 : 1, tid,
+                user_ids[i], concept_disp, vis_flag, hub_uri, tid, local_cid);
+        } else {
+            usql = sqlite3_mprintf(
+                "UPDATE tbl_iconinfo_%s SET dispLocation = %d, visible = %d, hubAppUri = %Q, emsDeletedFlag = %d WHERE titleId = %Q;"
+                "UPDATE tbl_concepticoninfo_%s SET dispLocation = %d, validFlag = %d, hubAppUri = %Q WHERE primaryTitleId = %Q;",
+                user_ids[i], disp_loc, vis_flag, hub_uri, is_vis ? 0 : 1, tid,
+                user_ids[i], concept_disp, vis_flag, hub_uri, tid);
+        }
         sqlite3_exec(db_app, usql, NULL, NULL, NULL);
         sqlite3_free(usql);
 
         if (!is_vis) {
-            char *dsql = sqlite3_mprintf("DELETE FROM tbl_group_%s WHERE itemId = %Q;", user_ids[i], tid);
+            char *dsql = sqlite3_mprintf(
+                "DELETE FROM tbl_group_%s WHERE itemId = %Q;"
+                "INSERT OR REPLACE INTO tbl_info_%s (key, value) VALUES ('nsx_content_flag_%s', '{\"deleted\":true,\"pushed\":true}');",
+                user_ids[i], tid, user_ids[i], tid);
             sqlite3_exec(db_app, dsql, NULL, NULL, NULL);
             sqlite3_free(dsql);
         }
@@ -544,23 +547,80 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     sqlite3_close(db_info);
     sqlite3_close(db_app);
     remove_wal_locks();
-
-    if (change_tab) {
-        patch_param_json_on_disk(tid, cat_type);
-    }
 }
 
+/*
+ * NEW Feature: Pin All Installed Games to Main Home Screen Bar
+ * Sets pinnedStatus = 1 and boosts lastAccessIndex across tbl_iconinfo_* & tbl_concepticoninfo_*
+ * so games stay on the main PS5 Home Screen instead of getting pushed into the Game Library.
+ */
+static void pin_all_games_to_main_screen(void) {
+    sqlite3 *db_app = NULL;
+    if (sqlite3_open(DB_APP_PATH, &db_app) != SQLITE_OK) return;
+    sqlite3_busy_timeout(db_app, 3000);
+    sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+
+    /* Boost lastAccessIndex & sortPriority on all visible non-system games */
+    sqlite3_exec(db_app,
+        "UPDATE tbl_contentinfo SET sortPriority = 100, lastAccessIndex = lastAccessIndex + 500 "
+        "WHERE titleId NOT LIKE 'NPXS%' AND dispLocation > 1;",
+        NULL, NULL, NULL);
+
+    sqlite3_stmt *ust = NULL;
+    char user_ids[16][32];
+    int ucount = 0;
+    if (sqlite3_prepare_v2(db_app, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';", -1, &ust, NULL) == SQLITE_OK) {
+        while (sqlite3_step(ust) == SQLITE_ROW && ucount < 16) {
+            const char *tname = (const char *)sqlite3_column_text(ust, 0);
+            if (tname && strlen(tname) > 13) strncpy(user_ids[ucount++], tname + 13, 31);
+        }
+        sqlite3_finalize(ust);
+    }
+
+    for (int i = 0; i < ucount; i++) {
+        char *psql = sqlite3_mprintf(
+            "UPDATE tbl_iconinfo_%s SET pinnedStatus = 1, visible = 1, lastAccessIndex = lastAccessIndex + 500 "
+            "WHERE titleId NOT LIKE 'NPXS%%' AND dispLocation > 1;"
+            "UPDATE tbl_concepticoninfo_%s SET validFlag = 1, lastAccessIndex = lastAccessIndex + 500 "
+            "WHERE primaryTitleId NOT LIKE 'NPXS%%' AND dispLocation > 1;",
+            user_ids[i], user_ids[i]);
+        sqlite3_exec(db_app, psql, NULL, NULL, NULL);
+        sqlite3_free(psql);
+    }
+
+    sqlite3_close(db_app);
+    remove_wal_locks();
+}
+
+/* 1-Click Bloatware Toggle (Covers Both 13.xx and 4.xx-12.xx PSN Bloat IDs, Leaves Welcome Hub Untouched!) */
 static void toggle_all_bloatware(int visible) {
-    const char *bloat_ids[] = { "NPXS40037", "NPXS40047", "NPXS40074", "NPXS40099", "NPXS40063", "NPXS40305" };
-    for (int i = 0; i < 6; i++) {
+    const char *bloat_ids[] = {
+        "NPXS40037", "NPXS40047", "NPXS40074", "NPXS40099", "NPXS40305", /* 13.xx IDs */
+        "NPXS40002", "NPXS40003", "NPXS40007", "NPXS40008"               /* 4.xx-12.xx IDs */
+    };
+    for (int i = 0; i < 9; i++) {
         update_1360_tile(bloat_ids[i], 0, 0, 1, visible);
     }
 }
 
-static int is_bloat_id(const char *tid) {
-    const char *bloat_ids[] = { "NPXS40037", "NPXS40047", "NPXS40074", "NPXS40099", "NPXS40063", "NPXS40305" };
-    for (int i = 0; i < 6; i++) {
-        if (strcmp(tid, bloat_ids[i]) == 0) return 1;
+/* System Tiles Allowed in the Dashboard List (Includes PSGFX-style System Apps!) */
+static int is_manageable_system_id(const char *tid) {
+    const char *sys_ids[] = {
+        "NPXS40037", /* PS Plus */
+        "NPXS40047", /* PS Store */
+        "NPXS40074", /* Remote Play */
+        "NPXS40099", /* Share Play */
+        "NPXS40063", /* Welcome Hub */
+        "NPXS40305", /* Live TV */
+        "NPXS40075", /* Media Gallery */
+        "NPXS40140", /* Disc Player */
+        "NPXS40054", /* Music Home */
+        "NPXS40053", /* Discover */
+        "NPXS40056", /* All Apps */
+        "NPXS40002", "NPXS40003", "NPXS40007", "NPXS40008", "NPXS40087"
+    };
+    for (int i = 0; i < 16; i++) {
+        if (strcmp(tid, sys_ids[i]) == 0) return 1;
     }
     return 0;
 }
@@ -569,14 +629,14 @@ static void send_dashboard_html(int client_fd) {
     const char *header =
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
         "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>PS5 TabShifter v1.3</title>"
+        "<title>PS5 TabShifter v1.1.0</title>"
         "<style>"
-        "body{background:#080a10;color:#f0f4f8;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;max-width:860px;margin:auto;}"
+        "body{background:#080a10;color:#f0f4f8;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;max-width:880px;margin:auto;}"
         "h1{font-size:24px;margin:0 0 6px 0;color:#fff;} .sub{color:#8b949e;font-size:14px;margin-bottom:18px;}"
         ".toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;}"
-        ".tbtn{flex:1;min-width:155px;text-align:center;padding:14px;border-radius:12px;text-decoration:none;font-weight:700;font-size:14px;color:#fff;border:2px solid transparent;}"
+        ".tbtn{flex:1;min-width:145px;text-align:center;padding:13px 10px;border-radius:12px;text-decoration:none;font-weight:700;font-size:13px;color:#fff;border:2px solid transparent;}"
         ".tbtn:focus,.tbtn:hover,.btn:focus,.btn:hover{border-color:#fff;transform:scale(1.02);}"
-        ".b-hide{background:#7c3aed;} .b-show{background:#334155;} .b-res{background:#b45309;} .b-uninst{background:#dc2626;}"
+        ".b-hide{background:#7c3aed;} .b-show{background:#334155;} .b-pin{background:#0284c7;} .b-res{background:#b45309;} .b-uninst{background:#dc2626;}"
         ".card{background:#121622;border:1px solid #22293a;border-radius:14px;padding:14px 18px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:12px;}"
         ".title{font-weight:700;font-size:16px;color:#fff;} .meta{color:#8b949e;font-size:13px;margin-top:4px;}"
         ".badge-m{background:#1d4ed8;color:#fff;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;}"
@@ -586,13 +646,14 @@ static void send_dashboard_html(int client_fd) {
         ".to-media{background:#2563eb;color:#fff;} .to-game{background:#10b981;color:#fff;}"
         ".h-btn{background:#1e293b;color:#cbd5e1;border:1px solid #334155;}"
         "</style></head><body>"
-        "<h1>PS5 TabShifter v1.3 (FW 13.60)</h1>"
-        "<div class='sub'>Move apps between <b>Games</b> &amp; <b>Media</b> tabs or hide dead PSN bloatware with instant UI reload.</div>"
+        "<h1>PS5 TabShifter v1.1.0</h1>"
+        "<div class='sub'>Move apps between <b>Games</b> &amp; <b>Media</b> tabs, pin games to main screen, or hide system bloatware.</div>"
         "<div class='toolbar'>"
-        "<a class='tbtn b-hide' href='/bloat?v=0'>🧹 Hide All PSN Bloatware</a>"
-        "<a class='tbtn b-show' href='/bloat?v=1'>Unhide PSN Bloatware</a>"
-        "<a class='tbtn b-res' href='/restore'>🔄 Restore DB Backup</a>"
-        "<a class='tbtn b-uninst' href='/uninstall'>🗑️ Uninstall Tile &amp; Exit</a>"
+        "<a class='tbtn b-hide' href='/bloat?v=0'>Hide PSN Bloatware</a>"
+        "<a class='tbtn b-show' href='/bloat?v=1'>Unhide Bloatware</a>"
+        "<a class='tbtn b-pin' href='/pin_all'>Pin All Games to Main Screen</a>"
+        "<a class='tbtn b-res' href='/restore'>Restore DB Backup</a>"
+        "<a class='tbtn b-uninst' href='/uninstall'>Uninstall Tile &amp; Exit</a>"
         "</div>";
 
     write(client_fd, header, strlen(header));
@@ -601,7 +662,7 @@ static void send_dashboard_html(int client_fd) {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_open(DB_APP_PATH, &db) == SQLITE_OK) {
         sqlite3_busy_timeout(db, 3000);
-        const char *q = "SELECT titleId, titleName, dispLocation, categoryType, is3rdPartyVideoApp FROM tbl_contentinfo ORDER BY dispLocation DESC, titleName ASC;";
+        const char *q = "SELECT titleId, titleName, dispLocation, categoryType, is3rdPartyVideoApp FROM tbl_contentinfo ORDER BY (dispLocation > 1) DESC, (titleId LIKE 'NPXS%') ASC, titleName ASC;";
         if (sqlite3_prepare_v2(db, q, -1, &stmt, NULL) == SQLITE_OK) {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 const char *tid = (const char *)sqlite3_column_text(stmt, 0);
@@ -611,7 +672,7 @@ static void send_dashboard_html(int client_fd) {
                 int is_vid = sqlite3_column_int(stmt, 4);
 
                 if (!tid || strcmp(tid, TITLE_ID) == 0) continue;
-                if (strncmp(tid, "NPXS", 4) == 0 && !is_bloat_id(tid)) continue;
+                if (strncmp(tid, "NPXS", 4) == 0 && !is_manageable_system_id(tid)) continue;
 
                 int is_media = (disp == DISP_MEDIA) || (ctype == CAT_MEDIA) || (is_vid == 1);
                 int is_vis = (disp > 1);
@@ -645,13 +706,10 @@ static void send_dashboard_html(int client_fd) {
 }
 
 int main(void) {
-    /* Prevent SIGPIPE from killing the payload when the PS5 browser closes sockets early */
     signal(SIGPIPE, SIG_IGN);
     syscall(SYS_thr_set_name, -1, "TabShifter.elf");
 
     backup_databases_once();
-
-    /* Install the native Home Screen shortcut via SceAppInstUtil */
     install_tabshifter_launcher(0);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -667,7 +725,6 @@ int main(void) {
     addr.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        /* If port 9095 is already running, force-reinstall the launcher tile and exit cleanly */
         install_tabshifter_launcher(1);
         ps5_notify("TabShifter Tile Reinstalled on Media Tab!");
         close(server_fd);
@@ -675,7 +732,7 @@ int main(void) {
     }
 
     listen(server_fd, 5);
-    ps5_notify("PS5 TabShifter v1.3 Ready!\nOpen TabShifter from your Media Tab!");
+    ps5_notify("PS5 TabShifter v1.1.0 Ready!\nOpen TabShifter from your Media Tab!");
 
     while (g_running) {
         int client = accept(server_fd, NULL, NULL);
@@ -710,6 +767,12 @@ int main(void) {
             int v = atoi(req + 13);
             toggle_all_bloatware(v);
             ps5_notify("%s PSN Bloatware!", v ? "Restored" : "Hid");
+            restart_sceshellui();
+            const char *redir = "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
+            write(client, redir, strlen(redir));
+        } else if (strncmp(req, "GET /pin_all", 12) == 0) {
+            pin_all_games_to_main_screen();
+            ps5_notify("Pinned All Games to Main Home Screen!");
             restart_sceshellui();
             const char *redir = "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
             write(client, redir, strlen(redir));
