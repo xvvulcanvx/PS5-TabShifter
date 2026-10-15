@@ -1,12 +1,13 @@
 /*
  * PS5 TabShifter.elf v1.1.0 (FW 12.xx / 13.00 / 13.40 / 13.60 Edition)
  *
- * Complete v1.1.0 Release:
- *  - Leaves appType / APP_TYPE untouched & removes AppInstallAll(0) (fixes fpkg/game padlocks)
- *  - Restores categoryType = 61440 for PS4 (CUSA) titles and 0 for PS5 (PPSA) titles on Games tab
- *  - Uses Sony's native hidden dispLocation (1) + emsDeletedFlag + nsx_content_flag for reboot persistence
- *  - Exposes Media Gallery, Disc Player, Music Home, Discover, Welcome, and All Apps for individual hiding
- *  - Adds "Pin All Games to Main Screen" to keep games on the main Home Screen bar
+ * Verified Safe v1.1.0 Release:
+ *  - FIXED PADLOCKS: Leaves appType / APP_TYPE completely untouched & removes AppInstallAll(0)
+ *  - PS4 & PS5 SUPPORT: Restores categoryType = 61440 for PS4 (CUSA) titles and 0 for PS5 (PPSA) titles
+ *  - REBOOT PERSISTENCE: Uses Sony's native hidden dispLocation (1) + emsDeletedFlag + nsx_content_flag
+ *  - PSGFX SYSTEM TILES: Exposes Media Gallery, Disc Player, Music Home, Discover, Welcome, and All Apps
+ *    for individual hiding while leaving Welcome Hub untouched during 1-click PSN Bloatware sweeps
+ *  - 12.02 - 13.60 SAFE: Skips missing Title IDs and prevents empty localConceptId matches
  */
 
 #include <stdio.h>
@@ -268,11 +269,6 @@ static int generate_ts_icon_png(const char *filepath) {
     return 0;
 }
 
-/*
- * Safe Home Screen Launcher Installer:
- * Uses ONLY sceAppInstUtilAppInstallTitleDir (NEVER calls sceAppInstUtilAppInstallAll,
- * which caused OS license check padlocks on fpkg games).
- */
 static int install_tabshifter_launcher(int force_reinstall) {
     if (!force_reinstall && access("/user/app/" TITLE_ID "/sce_sys/param.json", F_OK) == 0) {
         generate_ts_icon_png("/user/app/" TITLE_ID "/sce_sys/icon0.png");
@@ -373,12 +369,6 @@ static void update_concept_info_json(sqlite3 *db_app, const char *local_cid, int
     sqlite3_free(q);
 }
 
-/*
- * Core Tile Updater (v1.1.0):
- * - Leaves appType / APP_TYPE completely untouched (prevents fpkg/game padlocks)
- * - Restores categoryType = 61440 for PS4 (CUSA) titles and 0 for PS5 (PPSA) titles on Games tab
- * - Safely skips missing Title IDs so 12.02 / 13.00 / 13.40 / 13.60 never match empty localConceptIds
- */
 static void update_1360_tile(const char *tid, int change_tab, int to_media, int change_vis, int visible) {
     sqlite3 *db_app = NULL;
     sqlite3 *db_info = NULL;
@@ -525,48 +515,6 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     remove_wal_locks();
 }
 
-/*
- * Pin All Installed Games to Main Home Screen Bar:
- * Sets pinnedStatus = 1 and boosts lastAccessIndex across tbl_iconinfo_* & tbl_concepticoninfo_*
- * so games stay on the main PS5 Home Screen instead of dropping into the Game Library.
- */
-static void pin_all_games_to_main_screen(void) {
-    sqlite3 *db_app = NULL;
-    if (sqlite3_open(DB_APP_PATH, &db_app) != SQLITE_OK) return;
-    sqlite3_busy_timeout(db_app, 3000);
-    sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
-
-    sqlite3_exec(db_app,
-        "UPDATE tbl_contentinfo SET sortPriority = 100, lastAccessIndex = lastAccessIndex + 500 "
-        "WHERE titleId NOT LIKE 'NPXS%' AND dispLocation > 1;",
-        NULL, NULL, NULL);
-
-    sqlite3_stmt *ust = NULL;
-    char user_ids[16][32];
-    int ucount = 0;
-    if (sqlite3_prepare_v2(db_app, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';", -1, &ust, NULL) == SQLITE_OK) {
-        while (sqlite3_step(ust) == SQLITE_ROW && ucount < 16) {
-            const char *tname = (const char *)sqlite3_column_text(ust, 0);
-            if (tname && strlen(tname) > 13) strncpy(user_ids[ucount++], tname + 13, 31);
-        }
-        sqlite3_finalize(ust);
-    }
-
-    for (int i = 0; i < ucount; i++) {
-        char *psql = sqlite3_mprintf(
-            "UPDATE tbl_iconinfo_%s SET pinnedStatus = 1, visible = 1, lastAccessIndex = lastAccessIndex + 500 "
-            "WHERE titleId NOT LIKE 'NPXS%%' AND dispLocation > 1;"
-            "UPDATE tbl_concepticoninfo_%s SET validFlag = 1, lastAccessIndex = lastAccessIndex + 500 "
-            "WHERE primaryTitleId NOT LIKE 'NPXS%%' AND dispLocation > 1;",
-            user_ids[i], user_ids[i]);
-        sqlite3_exec(db_app, psql, NULL, NULL, NULL);
-        sqlite3_free(psql);
-    }
-
-    sqlite3_close(db_app);
-    remove_wal_locks();
-}
-
 /* 1-Click Bloatware Toggle (Covers 13.xx and 4.xx-12.xx PSN Bloat IDs, Leaves Welcome Hub Untouched) */
 static void toggle_all_bloatware(int visible) {
     const char *bloat_ids[] = {
@@ -609,9 +557,9 @@ static void send_dashboard_html(int client_fd) {
         "body{background:#080a10;color:#f0f4f8;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;max-width:880px;margin:auto;}"
         "h1{font-size:24px;margin:0 0 6px 0;color:#fff;} .sub{color:#8b949e;font-size:14px;margin-bottom:18px;}"
         ".toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;}"
-        ".tbtn{flex:1;min-width:145px;text-align:center;padding:13px 10px;border-radius:12px;text-decoration:none;font-weight:700;font-size:13px;color:#fff;border:2px solid transparent;}"
+        ".tbtn{flex:1;min-width:155px;text-align:center;padding:14px 12px;border-radius:12px;text-decoration:none;font-weight:700;font-size:14px;color:#fff;border:2px solid transparent;}"
         ".tbtn:focus,.tbtn:hover,.btn:focus,.btn:hover{border-color:#fff;transform:scale(1.02);}"
-        ".b-hide{background:#7c3aed;} .b-show{background:#334155;} .b-pin{background:#0284c7;} .b-res{background:#b45309;} .b-uninst{background:#dc2626;}"
+        ".b-hide{background:#7c3aed;} .b-show{background:#334155;} .b-res{background:#b45309;} .b-uninst{background:#dc2626;}"
         ".card{background:#121622;border:1px solid #22293a;border-radius:14px;padding:14px 18px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:12px;}"
         ".title{font-weight:700;font-size:16px;color:#fff;} .meta{color:#8b949e;font-size:13px;margin-top:4px;}"
         ".badge-m{background:#1d4ed8;color:#fff;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;}"
@@ -621,12 +569,11 @@ static void send_dashboard_html(int client_fd) {
         ".to-media{background:#2563eb;color:#fff;} .to-game{background:#10b981;color:#fff;}"
         ".h-btn{background:#1e293b;color:#cbd5e1;border:1px solid #334155;}"
         "</style></head><body>"
-        "<h1>PS5 TabShifter v1.1.0</h1>"
-        "<div class='sub'>Move apps between <b>Games</b> &amp; <b>Media</b> tabs, pin games to main screen, or hide system bloatware.</div>"
+        "<h1>PS5 TabShifter v1.1.0 (FW 12.xx - 13.60)</h1>"
+        "<div class='sub'>Move apps between <b>Games</b> &amp; <b>Media</b> tabs or hide dead PSN bloatware with instant UI reload.</div>"
         "<div class='toolbar'>"
         "<a class='tbtn b-hide' href='/bloat?v=0'>Hide PSN Bloatware</a>"
         "<a class='tbtn b-show' href='/bloat?v=1'>Unhide Bloatware</a>"
-        "<a class='tbtn b-pin' href='/pin_all'>Pin All Games to Main Screen</a>"
         "<a class='tbtn b-res' href='/restore'>Restore DB Backup</a>"
         "<a class='tbtn b-uninst' href='/uninstall'>Uninstall Tile &amp; Exit</a>"
         "</div>";
@@ -742,12 +689,6 @@ int main(void) {
             int v = atoi(req + 13);
             toggle_all_bloatware(v);
             ps5_notify("%s PSN Bloatware!", v ? "Restored" : "Hid");
-            restart_sceshellui();
-            const char *redir = "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
-            write(client, redir, strlen(redir));
-        } else if (strncmp(req, "GET /pin_all", 12) == 0) {
-            pin_all_games_to_main_screen();
-            ps5_notify("Pinned All Games to Main Home Screen!");
             restart_sceshellui();
             const char *redir = "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
             write(client, redir, strlen(redir));
