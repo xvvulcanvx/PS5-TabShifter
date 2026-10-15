@@ -2,19 +2,19 @@
 
 A standalone on-console payload utility for jailbroken PlayStation 5 consoles running Firmware 13.60 that allows you to:
 1. **Move apps between `[GAMES]` and `[MEDIA]` tabs** (keep emulators, stores, and homebrew organized in Media, or vice-versa).
-2. **Hide useless offline PSN bloatware** (`PlayStation Store`, `PlayStation Plus`, `Remote Play`, `Share Play`, `Welcome Hub`, `Live TV`).
+2. **Hide useless offline PSN bloatware** (PlayStation Store, PlayStation Plus, Remote Play, Share Play, Welcome Hub, Live TV).
 3. **Instantly reload `SceShellUI`** in ~1.5 seconds without a system reboot.
-4. **100% on-console control:** Installs a native Home Screen tile (`TBSH00001`) with a custom "TS" icon that can be opened or uninstalled directly using your DualSense controller.
+4. **100% on-console control:** Installs a native Home Screen tile (TBSH00001) with a custom "TS" icon that can be opened or uninstalled directly using your DualSense controller.
 
 ---
 
 ## Why TabShifter?
 
-On PS5 Firmware 13.60+, Sony split the dashboard database into two synchronized databases:
+On PS5 Firmware 13.60, Sony split the dashboard database into two synchronized databases:
 * `/system_data/priv/mms/appinfo.db` (`tbl_appinfo` and `tbl_conceptinfo`)
 * `/system_data/priv/mms/app.db` (`tbl_contentinfo`, `tbl_conceptmetadata`, and per-user `tbl_iconinfo_*` / `tbl_concepticoninfo_*` tables)
 
-Older database switchers fail on 13.60 because modifying `app.db` alone causes `SceShellCore` to overwrite changes using stale cache from `appinfo.db` or RAM. TabShifter updates all four database layers simultaneously alongside `param.json` manifests, applies the proper 13.60 category bitmasks (`1162` for Games vs `2236` for Media), and gracefully restarts `SceShellUI`.
+Older database switchers fail on 13.60 because modifying `app.db` alone causes `SceShellCore` to overwrite changes using stale cache from `appinfo.db` or RAM. TabShifter updates all four database layers simultaneously alongside `param.json` manifests, applies the proper 13.60 category bitmasks (1162 for Games vs 2236 for Media), and gracefully restarts `SceShellUI`.
 
 ---
 
