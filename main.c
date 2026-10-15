@@ -1,15 +1,12 @@
 /*
  * PS5 TabShifter.elf v1.1.0 (FW 12.xx / 13.00 / 13.40 / 13.60 Edition)
  *
- * Changelog in v1.1.0 (Community Feedback Update):
- *  1. FIXED PADLOCKS: Preserves each game's native appType (1 vs 5), stops modifying game param.json
- *     files on disk, and removes sceAppInstUtilAppInstallAll(0) so fpkg/dumped games never get padlocked.
- *  2. FIXED 12.02 COMPATIBILITY: Safely skips missing Title IDs and prevents empty localConceptId matches.
- *  3. REBOOT-PERSISTENT BLOATWARE HIDING: Uses Sony's native hidden dispLocation (1) + visible=0/validFlag=0.
- *  4. PSGFX SYSTEM TILES: Exposes Media Gallery, Disc Player, Music Home, Discover, Welcome, and All Apps
- *     for individual hiding while keeping Welcome Hub untouched during 1-click PSN Bloatware sweeps.
- *  5. MORE TILES ON MAIN SCREEN: Added "Pin All Games to Main Screen" to set pinnedStatus=1 and boost
- *     lastAccessIndex so installed games stay on the main Home Screen bar instead of dropping into Library.
+ * Complete v1.1.0 Release:
+ *  - Leaves appType / APP_TYPE untouched & removes AppInstallAll(0) (fixes fpkg/game padlocks)
+ *  - Restores categoryType = 61440 for PS4 (CUSA) titles and 0 for PS5 (PPSA) titles on Games tab
+ *  - Uses Sony's native hidden dispLocation (1) + emsDeletedFlag + nsx_content_flag for reboot persistence
+ *  - Exposes Media Gallery, Disc Player, Music Home, Discover, Welcome, and All Apps for individual hiding
+ *  - Adds "Pin All Games to Main Screen" to keep games on the main Home Screen bar
  */
 
 #include <stdio.h>
@@ -47,8 +44,9 @@
 #define CONCEPT_DISP_MEDIA  2236
 #define CONCEPT_DISP_HIDDEN 1
 
-#define CAT_GAME  0
-#define CAT_MEDIA 65536
+#define CAT_GAME      0
+#define CAT_PS4_GAME  61440
+#define CAT_MEDIA     65536
 
 typedef struct notify_request {
     char useless1[45];
@@ -273,7 +271,7 @@ static int generate_ts_icon_png(const char *filepath) {
 /*
  * Safe Home Screen Launcher Installer:
  * Uses ONLY sceAppInstUtilAppInstallTitleDir (NEVER calls sceAppInstUtilAppInstallAll,
- * which caused the OS license check padlocks on fpkg games).
+ * which caused OS license check padlocks on fpkg games).
  */
 static int install_tabshifter_launcher(int force_reinstall) {
     if (!force_reinstall && access("/user/app/" TITLE_ID "/sce_sys/param.json", F_OK) == 0) {
@@ -321,7 +319,6 @@ static int install_tabshifter_launcher(int force_reinstall) {
     if (sceAppInstUtilAppInstallTitleDir) {
         err = sceAppInstUtilAppInstallTitleDir(TITLE_ID, "/user/app/", 0);
     }
-    /* Note: Never call sceAppInstUtilAppInstallAll(0) here, as it triggers fpkg license padlocks */
 
     sceAppInstUtilTerminate();
     return err;
@@ -378,10 +375,9 @@ static void update_concept_info_json(sqlite3 *db_app, const char *local_cid, int
 
 /*
  * Core Tile Updater (v1.1.0):
- * - Preserves each game's original appType (1 for PS5 games, 5 for homebrew) when moving back to Games
- *   so games NEVER get padlocked!
- * - Skips missing Title IDs safely so 12.02 / 13.00 / 13.40 consoles never match empty localConceptIds.
- * - Does not touch game param.json files on disk (prevents "Ongoing" / corrupted param.json lockouts).
+ * - Leaves appType / APP_TYPE completely untouched (prevents fpkg/game padlocks)
+ * - Restores categoryType = 61440 for PS4 (CUSA) titles and 0 for PS5 (PPSA) titles on Games tab
+ * - Safely skips missing Title IDs so 12.02 / 13.00 / 13.40 / 13.60 never match empty localConceptIds
  */
 static void update_1360_tile(const char *tid, int change_tab, int to_media, int change_vis, int visible) {
     sqlite3 *db_app = NULL;
@@ -403,28 +399,23 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     int curr_disp = DISP_GAME;
     int curr_cat = CAT_GAME;
     int curr_video = 0;
-    int curr_apptype = 1;
-    int curr_concept_id = 0;
     int row_found = 0;
 
     sqlite3_stmt *st = NULL;
-    char *q = sqlite3_mprintf("SELECT dispLocation, categoryType, is3rdPartyVideoApp, appType, conceptId, localConceptId FROM tbl_contentinfo WHERE titleId = %Q;", tid);
+    char *q = sqlite3_mprintf("SELECT dispLocation, categoryType, is3rdPartyVideoApp, localConceptId FROM tbl_contentinfo WHERE titleId = %Q;", tid);
     if (sqlite3_prepare_v2(db_app, q, -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) {
             row_found = 1;
             curr_disp = sqlite3_column_int(st, 0);
             curr_cat = sqlite3_column_int(st, 1);
             curr_video = sqlite3_column_int(st, 2);
-            curr_apptype = sqlite3_column_int(st, 3);
-            curr_concept_id = sqlite3_column_int(st, 4);
-            const char *cid_txt = (const char *)sqlite3_column_text(st, 5);
+            const char *cid_txt = (const char *)sqlite3_column_text(st, 3);
             if (cid_txt) strncpy(local_cid, cid_txt, sizeof(local_cid) - 1);
         }
         sqlite3_finalize(st);
     }
     sqlite3_free(q);
 
-    /* If this titleId does not exist on this console/firmware, abort safely! */
     if (!row_found) {
         sqlite3_close(db_info);
         sqlite3_close(db_app);
@@ -436,24 +427,10 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
 
     int disp_loc     = is_media ? DISP_MEDIA : DISP_GAME;
     int concept_disp = is_media ? CONCEPT_DISP_MEDIA : CONCEPT_DISP_GAME;
-    int cat_type     = is_media ? CAT_MEDIA : CAT_GAME;
+    int default_game_cat = (strncmp(tid, "CUSA", 4) == 0) ? CAT_PS4_GAME : CAT_GAME;
+    int cat_type     = is_media ? CAT_MEDIA : (change_tab ? default_game_cat : curr_cat);
     int is_video     = is_media ? 1 : 0;
     int vis_flag     = is_vis ? 1 : 0;
-
-    /* Preserve original appType! Only set 0 when moving to Media; restore 1 for retail/fpkg games or 5 for homebrew */
-    int app_type_val = curr_apptype;
-    if (change_tab) {
-        if (is_media) {
-            app_type_val = 0;
-        } else {
-            /* Native PS5 games have conceptId > 0 and start with PPSA/CUSA -> appType 1 */
-            if (strncmp(tid, "PPSA", 4) == 0 && curr_concept_id > 0 && strncmp(tid, "PPSA99", 6) != 0) {
-                app_type_val = 1;
-            } else {
-                app_type_val = (curr_apptype > 0) ? curr_apptype : 5;
-            }
-        }
-    }
 
     char hub_uri[128];
     snprintf(hub_uri, sizeof(hub_uri), is_media ? "psmediahub:main?titleId=%s" : "pshome:gamehub?titleId=%s", tid);
@@ -462,7 +439,6 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
         disp_loc = DISP_HIDDEN;
         concept_disp = CONCEPT_DISP_HIDDEN;
     } else if (!change_tab && strncmp(tid, "NPXS", 4) == 0) {
-        /* Restore native system dispLocations when unhiding system apps */
         if (strcmp(tid, "NPXS40037") == 0 || strcmp(tid, "NPXS40063") == 0) { disp_loc = 147; concept_disp = 2195; }
         else if (strcmp(tid, "NPXS40047") == 0 || strcmp(tid, "NPXS40071") == 0) { disp_loc = 146; concept_disp = 2194; }
         else if (strcmp(tid, "NPXS40074") == 0 || strcmp(tid, "NPXS40099") == 0) { disp_loc = 155; concept_disp = 2203; }
@@ -472,13 +448,13 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
         else if (strcmp(tid, "NPXS40056") == 0 || strcmp(tid, "NPXS40139") == 0) { disp_loc = 148; concept_disp = 2196; }
     }
 
+    /* Leave APP_TYPE / appType untouched so games never get padlocked */
     char *sql_info = sqlite3_mprintf(
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'DISPLAYLOCATION';"
         "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'CATEGORY_TYPE';"
         "UPDATE tbl_appinfo SET val = %Q WHERE titleId = %Q AND key = 'HUBAPP_URI';"
-        "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'APP_TYPE';"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
-        disp_loc, tid, cat_type, tid, hub_uri, tid, app_type_val, tid);
+        disp_loc, tid, cat_type, tid, hub_uri, tid);
     sqlite3_exec(db_info, sql_info, NULL, NULL, NULL);
     sqlite3_free(sql_info);
 
@@ -492,12 +468,12 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
     }
 
     char *sql_app = sqlite3_mprintf(
-        "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, appType = %d, pprHubAppUri = %Q, "
-        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q, '$.APP_TYPE', %d) "
+        "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, pprHubAppUri = %Q, "
+        "AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q) "
         "WHERE titleId = %Q;"
         "UPDATE tbl_version SET status = status + 1 WHERE category LIKE '%%sync_index%%';",
-        disp_loc, cat_type, is_video, app_type_val, hub_uri,
-        disp_loc, cat_type, hub_uri, app_type_val, tid);
+        disp_loc, cat_type, is_video, hub_uri,
+        disp_loc, cat_type, hub_uri, tid);
     sqlite3_exec(db_app, sql_app, NULL, NULL, NULL);
     sqlite3_free(sql_app);
 
@@ -550,9 +526,9 @@ static void update_1360_tile(const char *tid, int change_tab, int to_media, int 
 }
 
 /*
- * NEW Feature: Pin All Installed Games to Main Home Screen Bar
+ * Pin All Installed Games to Main Home Screen Bar:
  * Sets pinnedStatus = 1 and boosts lastAccessIndex across tbl_iconinfo_* & tbl_concepticoninfo_*
- * so games stay on the main PS5 Home Screen instead of getting pushed into the Game Library.
+ * so games stay on the main PS5 Home Screen instead of dropping into the Game Library.
  */
 static void pin_all_games_to_main_screen(void) {
     sqlite3 *db_app = NULL;
@@ -560,7 +536,6 @@ static void pin_all_games_to_main_screen(void) {
     sqlite3_busy_timeout(db_app, 3000);
     sqlite3_exec(db_app, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
 
-    /* Boost lastAccessIndex & sortPriority on all visible non-system games */
     sqlite3_exec(db_app,
         "UPDATE tbl_contentinfo SET sortPriority = 100, lastAccessIndex = lastAccessIndex + 500 "
         "WHERE titleId NOT LIKE 'NPXS%' AND dispLocation > 1;",
@@ -592,7 +567,7 @@ static void pin_all_games_to_main_screen(void) {
     remove_wal_locks();
 }
 
-/* 1-Click Bloatware Toggle (Covers Both 13.xx and 4.xx-12.xx PSN Bloat IDs, Leaves Welcome Hub Untouched!) */
+/* 1-Click Bloatware Toggle (Covers 13.xx and 4.xx-12.xx PSN Bloat IDs, Leaves Welcome Hub Untouched) */
 static void toggle_all_bloatware(int visible) {
     const char *bloat_ids[] = {
         "NPXS40037", "NPXS40047", "NPXS40074", "NPXS40099", "NPXS40305", /* 13.xx IDs */
@@ -603,7 +578,7 @@ static void toggle_all_bloatware(int visible) {
     }
 }
 
-/* System Tiles Allowed in the Dashboard List (Includes PSGFX-style System Apps!) */
+/* System Tiles Allowed in the Dashboard List (Includes PSGFX-style System Apps) */
 static int is_manageable_system_id(const char *tid) {
     const char *sys_ids[] = {
         "NPXS40037", /* PS Plus */
