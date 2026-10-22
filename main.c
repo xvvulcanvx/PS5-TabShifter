@@ -330,7 +330,8 @@ static int apply_self_update(const uint8_t *binary_data, size_t binary_len) {
 
 static int get_all_user_ids(sqlite3 *db, char uids[MAX_USER_PROFILES][32]) {
     sqlite3_stmt *stmt;
-    const char *sql = "SELECT name FROM sqlite3_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';";
+    /* FIXED: sqlite_master instead of sqlite3_master */
+    const char *sql = "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%';";
     int count = 0;
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
@@ -352,7 +353,8 @@ static int get_all_user_ids(sqlite3 *db, char uids[MAX_USER_PROFILES][32]) {
 static bool table_exists(sqlite3 *db, const char *table_name) {
     sqlite3_stmt *stmt;
     bool exists = false;
-    const char *sql = "SELECT 1 FROM sqlite3_master WHERE type='table' AND name = ?;";
+    /* FIXED: sqlite_master instead of sqlite3_master */
+    const char *sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
         if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
@@ -551,7 +553,6 @@ static void ensure_tabshifter_tile_installed(sqlite3 *app_db, char uids[MAX_USER
     sqlite3_stmt *stmt;
     char template_tid[32] = {0};
 
-    /* Find best donor row to clone (prefer PLDM, FMGR, FAKE, or any PPSA/CUSA) */
     const char *find_donor =
         "SELECT titleId FROM tbl_contentinfo WHERE titleId != 'TBSH00001' "
         "ORDER BY CASE "
@@ -573,12 +574,7 @@ static void ensure_tabshifter_tile_installed(sqlite3 *app_db, char uids[MAX_USER
 
     sqlite3_exec(app_db, "BEGIN IMMEDIATE TRANSACTION;", NULL, NULL, NULL);
 
-    /* 1. Clone into tbl_contentinfo if not exists */
     char sql[1024];
-    snprintf(sql, sizeof(sql),
-             "INSERT OR IGNORE INTO tbl_contentinfo SELECT * FROM tbl_contentinfo WHERE titleId = '%s';",
-             template_tid);
-    /* Since primary key is titleId, use a temporary table clone if TBSH00001 is missing */
     bool has_tbsh = false;
     if (sqlite3_prepare_v2(app_db, "SELECT 1 FROM tbl_contentinfo WHERE titleId = 'TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) has_tbsh = true;
@@ -594,7 +590,6 @@ static void ensure_tabshifter_tile_installed(sqlite3 *app_db, char uids[MAX_USER
         sqlite3_exec(app_db, "DROP TABLE IF EXISTS temp_tbsh_c;", NULL, NULL, NULL);
     }
 
-    /* Patch TBSH00001 tbl_contentinfo columns & JSON */
     char *donor_json = NULL;
     if (sqlite3_prepare_v2(app_db, "SELECT AppInfoJson FROM tbl_contentinfo WHERE titleId = 'TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -623,7 +618,6 @@ static void ensure_tabshifter_tile_installed(sqlite3 *app_db, char uids[MAX_USER
     }
     free(patched_tbsh_json);
 
-    /* 2. Clone into tbl_conceptmetadata */
     bool has_concept = false;
     if (sqlite3_prepare_v2(app_db, "SELECT 1 FROM tbl_conceptmetadata WHERE localConceptId = 'cid:local:TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) has_concept = true;
@@ -663,7 +657,6 @@ static void ensure_tabshifter_tile_installed(sqlite3 *app_db, char uids[MAX_USER
     }
     free(patched_tbsh_cjson);
 
-    /* 3. Register in User Presentation Tables */
     for (int i = 0; i < uid_count; i++) {
         bool has_icon = false;
         snprintf(sql, sizeof(sql), "SELECT 1 FROM tbl_iconinfo_%s WHERE titleId = 'TBSH00001';", uids[i]);
@@ -779,7 +772,6 @@ static int internal_shift_single(sqlite3 *app_db, sqlite3 *appinfo_db,
         snprintf(hub_uri, sizeof(hub_uri), "pshome:gamehub?titleId=%s", title_id);
     }
 
-    /* Preserve original categoryType & appType to prevent PS4/PS5 padlock icons */
     const char *up_content =
         "UPDATE tbl_contentinfo SET dispLocation = ?, is3rdPartyVideoApp = ?, "
         "pprHubAppUri = CASE WHEN titleId LIKE 'NPXS%' AND titleId != 'NPXS40063' THEN pprHubAppUri ELSE ? END, "
@@ -883,7 +875,6 @@ static int internal_set_visibility(sqlite3 *app_db, sqlite3 *appinfo_db,
     internal_shift_single(app_db, appinfo_db, uids, uid_count, title_id, target_loc);
 
     for (int i = 0; i < uid_count; i++) {
-        /* 1. Update visible, emsDeletedFlag, and emsPushedFlag in tbl_iconinfo_<UID> */
         snprintf(sql, sizeof(sql),
                  "UPDATE tbl_iconinfo_%s SET visible = ?, dispLocation = ?, "
                  "emsDeletedFlag = ?, emsPushedFlag = ? WHERE titleId = ?;", uids[i]);
@@ -897,7 +888,6 @@ static int internal_set_visibility(sqlite3 *app_db, sqlite3 *appinfo_db,
             sqlite3_finalize(stmt);
         }
 
-        /* 2. Update nsx_content_flag in tbl_info_<UID> with pushed:false (Fixes Issues #16 & #17) */
         snprintf(sql, sizeof(sql), "INSERT OR REPLACE INTO tbl_info_%s (key, value) VALUES (?, ?);", uids[i]);
         if (sqlite3_prepare_v2(app_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
             char flag_key[128];
@@ -909,7 +899,6 @@ static int internal_set_visibility(sqlite3 *app_db, sqlite3 *appinfo_db,
             sqlite3_finalize(stmt);
         }
 
-        /* 3. Purge from tbl_group_<UID> MyHome so Rest Mode wake does not recreate shortcut */
         char grp_table[64];
         snprintf(grp_table, sizeof(grp_table), "tbl_group_%s", uids[i]);
         if (hide && table_exists(app_db, grp_table)) {
@@ -1603,7 +1592,7 @@ static bool handle_http_client(int client_fd, sqlite3 *app_db, sqlite3 *appinfo_
 /* ========================================================================= */
 
 int main(void) {
-    /* 1. Gracefully stop any running v1.2.1/v1.3.0 instance holding port 9095 */
+    /* 1. Gracefully stop any running instance holding port 9095 */
     kill_existing_tabshifter_instance();
 
     /* 2. Create one-time untouched .bak safety snapshot if not present */
@@ -1618,9 +1607,12 @@ int main(void) {
         return 1;
     }
     sqlite3_busy_timeout(app_db, SQLITE_BUSY_TIMEOUT_MS);
+    /* Keep temp tables in RAM so PS5 sandboxed /tmp permissions never fail */
+    sqlite3_exec(app_db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
 
     if (sqlite3_open(APPINFO_DB_PATH, &appinfo_db) == SQLITE_OK) {
         sqlite3_busy_timeout(appinfo_db, SQLITE_BUSY_TIMEOUT_MS);
+        sqlite3_exec(appinfo_db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
     } else {
         appinfo_db = NULL;
     }
@@ -1651,7 +1643,7 @@ int main(void) {
     addr.sin_port = htons(HTTP_PORT);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(server_fd, 8) < 0) {
-        notify_ps5("TabShifter v1.3.0: Port %d busy!\nReboot or close old instance.", HTTP_PORT);
+        notify_ps5("TabShifter v1.3.0: Port %d busy!\nReboot PS5 once to clear old v1.2.1.", HTTP_PORT);
         close(server_fd);
         if (appinfo_db) sqlite3_close(appinfo_db);
         sqlite3_close(app_db);
