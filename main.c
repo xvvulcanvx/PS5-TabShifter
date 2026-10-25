@@ -22,6 +22,9 @@
 #define TBSH_TITLE_ID           "TBSH00001"
 #define DEFAULT_ELF_FALLBACK    "/data/pldmgr/payloads/TabShifter.elf"
 
+#define TBSH_STATE_DIR          "/data/tabshifter"
+#define TBSH_REMOVED_MARKER     TBSH_STATE_DIR "/tile_removed"
+
 #define APP_DB_PATH             "/system_data/priv/mms/app.db"
 #define APPINFO_DB_PATH         "/system_data/priv/mms/appinfo.db"
 
@@ -526,6 +529,100 @@ static void install_tabshifter_launcher(sqlite3 *app_db, sqlite3 *appinfo_db, ch
 }
 
 /* ========================================================================= */
+/*        TBSH00001 TILE UNINSTALLER (UNDOES install_tabshifter_launcher)    */
+/* ========================================================================= */
+
+static bool is_tile_removal_requested(void) {
+    struct stat st;
+    return stat(TBSH_REMOVED_MARKER, &st) == 0;
+}
+
+static void set_tile_removal_marker(bool removed) {
+    if (removed) {
+        mkdir(TBSH_STATE_DIR, 0777);
+        FILE *fp = fopen(TBSH_REMOVED_MARKER, "wb");
+        if (fp) fclose(fp);
+    } else {
+        unlink(TBSH_REMOVED_MARKER);
+    }
+}
+
+static bool tbsh_tile_row_exists(sqlite3 *app_db) {
+    sqlite3_stmt *stmt;
+    bool exists = false;
+    if (sqlite3_prepare_v2(app_db, "SELECT 1 FROM tbl_contentinfo WHERE titleId='TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
+        sqlite3_finalize(stmt);
+    }
+    return exists;
+}
+
+static void remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                char child[512];
+                snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+                remove_tree(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static void uninstall_tabshifter_launcher(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MAX_USER_PROFILES][32], int uid_count) {
+    /* One statement per exec: a table missing on some firmware must not abort the rest */
+    sqlite3_exec(app_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+    sqlite3_exec(app_db, "DELETE FROM tbl_contentinfo WHERE titleId='TBSH00001';", NULL, NULL, NULL);
+    sqlite3_exec(app_db, "DELETE FROM tbl_conceptmetadata WHERE localConceptId='cid:local:TBSH00001';", NULL, NULL, NULL);
+
+    for (int i = 0; i < uid_count; i++) {
+        char *q = sqlite3_mprintf("DELETE FROM tbl_iconinfo_%s WHERE titleId='TBSH00001';", uids[i]);
+        sqlite3_exec(app_db, q, NULL, NULL, NULL);
+        sqlite3_free(q);
+
+        q = sqlite3_mprintf("DELETE FROM tbl_concepticoninfo_%s WHERE primaryTitleId='TBSH00001' OR localConceptId='cid:local:TBSH00001';", uids[i]);
+        sqlite3_exec(app_db, q, NULL, NULL, NULL);
+        sqlite3_free(q);
+
+        char tbl[64];
+        snprintf(tbl, sizeof(tbl), "tbl_group_%s", uids[i]);
+        if (table_exists(app_db, tbl)) {
+            q = sqlite3_mprintf("DELETE FROM %s WHERE itemId='TBSH00001';", tbl);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+        }
+
+        snprintf(tbl, sizeof(tbl), "tbl_info_%s", uids[i]);
+        if (table_exists(app_db, tbl)) {
+            q = sqlite3_mprintf("DELETE FROM %s WHERE key='nsx_content_flag_TBSH00001';", tbl);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+        }
+    }
+    sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL);
+
+    if (appinfo_db) {
+        sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        sqlite3_exec(appinfo_db, "DELETE FROM tbl_appinfo WHERE titleId='TBSH00001';", NULL, NULL, NULL);
+        sqlite3_exec(appinfo_db, "DELETE FROM tbl_conceptinfo WHERE local_concept_id='cid:local:TBSH00001';", NULL, NULL, NULL);
+        sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL);
+    }
+
+    remove_tree("/user/app/TBSH00001");
+    remove_tree("/user/appmeta/TBSH00001");
+    remove_tree("/system_data/priv/appmeta/TBSH00001");
+}
+
+/* ========================================================================= */
 /*               CORE DATABASE OPERATIONS (EXACT V1.2.1 + UNIVERSAL)         */
 /* ========================================================================= */
 
@@ -822,7 +919,9 @@ static int repair_all_padlocks(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[M
     if (appinfo_db) sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL);
     sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL);
 
-    install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+    if (!is_tile_removal_requested()) {
+        install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+    }
     return SQLITE_OK;
 }
 
@@ -873,7 +972,7 @@ static int restore_clean_db_backup(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_pt
         sqlite3_exec(*appinfo_db_ptr, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
     }
 
-    if (*app_db_ptr) {
+    if (*app_db_ptr && !is_tile_removal_requested()) {
         install_tabshifter_launcher(*app_db_ptr, *appinfo_db_ptr, uids, uid_count);
     }
 
@@ -949,6 +1048,8 @@ static const char *WEB_UI_HTML =
 "      <button type='button' class='btn btn-primary' onclick='smartTidy()'>Smart Tidy</button>"
 "      <button type='button' class='btn btn-warn' onclick='fixPadlocks()'>Fix Padlocks</button>"
 "      <button type='button' class='btn btn-danger' onclick='restoreOriginalDb()'>Restore DB Backup</button>"
+"      <button type='button' class='btn btn-primary' id='tile-btn' style='display:none' onclick='installTile()'>Add Media Tile</button>"
+"      <button type='button' class='btn btn-danger' onclick='uninstallTabShifter()'>Uninstall</button>"
 "    </div>"
 "  </div>"
 "</div>"
@@ -1062,6 +1163,20 @@ static const char *WEB_UI_HTML =
 "    else{alert('No backup file found on disk!');}"
 "  }"
 "}"
+"async function uninstallTabShifter(){"
+"  if(confirm('Remove the TabShifter tile from the Media tab for all users, delete its files and stop the payload? Your app layout and DB backups are kept.')){"
+"    const res=await fetch('/api/uninstall',{method:'POST'});"
+"    if(res.ok){document.querySelector('.container').innerHTML='<h1>TabShifter uninstalled</h1><p style=\"margin-top:12px;color:#8b949e\">The Media tile is gone and the payload has stopped. Delete TabShifter.elf from your payloads folder to remove it completely.</p>';}"
+"    else{alert('Uninstall failed.');}"
+"  }"
+"}"
+"async function installTile(){"
+"  const res=await fetch('/api/install-tile',{method:'POST'});"
+"  if(res.ok){document.getElementById('tile-btn').style.display='none';showToast('TabShifter tile added & PS5 UI reloaded!');}"
+"}"
+"async function checkTile(){"
+"  try{const v=await fetch('/api/version').then(r=>r.json());if(v.tile===false)document.getElementById('tile-btn').style.display='inline-block';}catch(e){}"
+"}"
 "function toggleChangelog(){"
 "  const d=document.getElementById('changelog-drawer');"
 "  const b=document.getElementById('ub-chg-btn');"
@@ -1102,7 +1217,7 @@ static const char *WEB_UI_HTML =
 "    else{btn.textContent='Update Failed';btn.disabled=false;}"
 "  }catch(e){btn.textContent='Error';btn.disabled=false;}"
 "}"
-"loadApps();checkGitHubUpdate();"
+"loadApps();checkTile();checkGitHubUpdate();"
 "</script></body></html>";
 
 /* ========================================================================= */
@@ -1256,12 +1371,27 @@ static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **ap
         free(req);
         close(client_fd);
         return false;
+    } else if (strncmp((char *)req, "POST /api/uninstall", 19) == 0) {
+        uninstall_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+        set_tile_removal_marker(true);
+        send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
+        free(req);
+        close(client_fd);
+        reload_sceshellui();
+        notify_ps5("TabShifter uninstalled.\nDelete TabShifter.elf to remove the payload.");
+        return false;
+    } else if (strncmp((char *)req, "POST /api/install-tile", 22) == 0) {
+        set_tile_removal_marker(false);
+        install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+        reload_sceshellui();
+        send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strncmp((char *)req, "GET / ", 6) == 0 || strncmp((char *)req, "GET /?", 6) == 0) {
         send_http_response(client_fd, 200, "text/html; charset=utf-8", WEB_UI_HTML, strlen(WEB_UI_HTML));
     } else if (strncmp((char *)req, "GET /api/version", 16) == 0) {
-        char elf_path[512], vjson[640];
+        char elf_path[512], vjson[680];
         get_running_elf_path(elf_path, sizeof(elf_path));
-        int vlen = snprintf(vjson, sizeof(vjson), "{\"version\":\"%s\",\"elf_path\":\"%s\"}", TABSHIFTER_VERSION, elf_path);
+        int vlen = snprintf(vjson, sizeof(vjson), "{\"version\":\"%s\",\"elf_path\":\"%s\",\"tile\":%s}",
+                            TABSHIFTER_VERSION, elf_path, tbsh_tile_row_exists(app_db) ? "true" : "false");
         send_http_response(client_fd, 200, "application/json", vjson, (size_t)vlen);
     } else if (strncmp((char *)req, "GET /api/apps", 13) == 0) {
         char *ajson = build_apps_json(app_db, uids[0]);
@@ -1340,10 +1470,23 @@ int main(void) {
         return 1;
     }
 
-    bool already_installed = is_tbsh_tile_already_installed(app_db);
-    install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
-    if (!already_installed) {
+    struct stat app_dir_st;
+    bool tile_shown = true;
+    if (tbsh_tile_row_exists(app_db) && stat("/user/app/TBSH00001", &app_dir_st) != 0) {
+        /* Deleted from the PS5 home screen: the system removed the app folder but
+           not the rows we injected. Finish the removal and remember the choice. */
+        uninstall_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+        set_tile_removal_marker(true);
         reload_sceshellui();
+        tile_shown = false;
+    } else if (is_tile_removal_requested()) {
+        tile_shown = false;
+    } else {
+        bool already_installed = is_tbsh_tile_already_installed(app_db);
+        install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+        if (!already_installed) {
+            reload_sceshellui();
+        }
     }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1366,7 +1509,11 @@ int main(void) {
         return 1;
     }
 
-    notify_ps5("PS5 TabShifter v1.3.0 Ready!\nOpen TabShifter from your Media Tab!");
+    if (tile_shown) {
+        notify_ps5("PS5 TabShifter v1.3.0 Ready!\nOpen TabShifter from your Media Tab!");
+    } else {
+        notify_ps5("PS5 TabShifter v1.3.0 Ready!\nOpen http://<PS5_IP>:%d/ in a browser.", HTTP_PORT);
+    }
 
     bool running = true;
     while (running) {
