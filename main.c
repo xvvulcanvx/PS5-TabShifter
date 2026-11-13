@@ -96,9 +96,9 @@ static void reload_sceshellui(void) {
     if (sysctl(mib, 3, buf, &buf_size, NULL, 0) == 0) {
         uint8_t *ptr = buf;
         uint8_t *end = buf + buf_size;
-        while (ptr + sizeof(int) < end) {
+        while (ptr + sizeof(int) <= end) {
             int struct_size = *(int *)ptr;
-            if (struct_size <= 0) break;
+            if (struct_size <= 0 || ptr + struct_size > end) break;
             for (int off = 0; off < struct_size - 12; off++) {
                 if (memcmp(ptr + off, "SceShellUI", 10) == 0) {
                     pid_t pid = *(pid_t *)(ptr + 72);
@@ -153,6 +153,7 @@ static void write_png_chunk(FILE *fp, const char type[4], const uint8_t *data, u
     if (len > 0 && data) fwrite(data, 1, len, fp);
 
     uint8_t *crc_buf = malloc(4 + len);
+    if (!crc_buf) return;
     memcpy(crc_buf, type, 4);
     if (len > 0 && data) memcpy(crc_buf + 4, data, len);
     uint32_t crc = crc32_calc(crc_buf, 4 + len);
@@ -204,6 +205,7 @@ static void generate_ts_icon_png(const char *filepath) {
 
     size_t max_zlib = raw_size + (raw_size / 32000 + 2) * 5 + 6;
     uint8_t *zbuf = malloc(max_zlib);
+    if (!zbuf) { free(raw); return; }
     size_t zpos = 0;
     zbuf[zpos++] = 0x78; zbuf[zpos++] = 0x01;
 
@@ -895,10 +897,27 @@ static int internal_shift_single(sqlite3 *app_db, sqlite3 *appinfo_db,
 static int internal_set_visibility(sqlite3 *app_db, sqlite3 *appinfo_db,
                                    char uids[MAX_USER_PROFILES][32], int uid_count,
                                    const char *title_id, bool hide) {
-    char local_cid[128];
-    snprintf(local_cid, sizeof(local_cid), "cid:local:%s", title_id);
+    if (!title_id) return SQLITE_OK;
 
-    int restore_loc = DISP_LOCATION_GAMES;
+    sqlite3_stmt *stmt;
+    char local_cid[128] = {0};
+    char *app_json = NULL;
+    int cat_type = 0;
+
+    if (sqlite3_prepare_v2(app_db, "SELECT localConceptId, categoryType, AppInfoJson FROM tbl_contentinfo WHERE titleId = ?;", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, title_id, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *cid = (const char *)sqlite3_column_text(stmt, 0);
+            cat_type = sqlite3_column_int(stmt, 1);
+            const char *aj = (const char *)sqlite3_column_text(stmt, 2);
+            if (cid) strncpy(local_cid, cid, sizeof(local_cid) - 1);
+            if (aj) app_json = strdup(aj);
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (local_cid[0] == '\0') snprintf(local_cid, sizeof(local_cid), "cid:local:%s", title_id);
+
+    int restore_loc = (cat_type == CATEGORY_MEDIA_APP) ? DISP_LOCATION_MEDIA : DISP_LOCATION_GAMES;
     if (strcmp(title_id, "NPXS40053") == 0 || strcmp(title_id, "NPXS40054") == 0 ||
         strcmp(title_id, "NPXS40056") == 0 || strcmp(title_id, "NPXS40139") == 0) {
         restore_loc = DISP_LOCATION_MEDIA;
@@ -917,17 +936,6 @@ static int internal_set_visibility(sqlite3 *app_db, sqlite3 *appinfo_db,
     int del_flag = hide ? 1 : 0;
 
     /* 1. Update tbl_contentinfo (supports both flat JSON and legacy field_list) */
-    sqlite3_stmt *stmt;
-    char *app_json = NULL;
-    if (sqlite3_prepare_v2(app_db, "SELECT AppInfoJson FROM tbl_contentinfo WHERE titleId = ?;", -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, title_id, -1, SQLITE_STATIC);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char *aj = (const char *)sqlite3_column_text(stmt, 0);
-            if (aj) app_json = strdup(aj);
-        }
-        sqlite3_finalize(stmt);
-    }
-
     if (app_json && strstr(app_json, "\"field_list\"") != NULL) {
         char *patched_fl = update_concept_info_json(app_json, target_loc);
         char *qc = sqlite3_mprintf("UPDATE tbl_contentinfo SET dispLocation = %d, AppInfoJson = %Q WHERE titleId = %Q;",
@@ -1014,36 +1022,56 @@ static int internal_set_pin(sqlite3 *app_db, char uids[MAX_USER_PROFILES][32], i
 /*          SMART TIDY, PADLOCK REPAIR & PRISTINE BACKUP RESTORE             */
 /* ========================================================================= */
 
-static int execute_smart_tidy(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MAX_USER_PROFILES][32], int uid_count) {
+typedef struct {
+    char tid[16];
+    int loc;
+} TitleLocEntry;
+
+static int collect_content_titles(sqlite3 *app_db, const char *sql, TitleLocEntry **out_items) {
+    *out_items = NULL;
     sqlite3_stmt *stmt;
+    int count = 0, cap = 0;
+    if (sqlite3_prepare_v2(app_db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        int l = (sqlite3_column_count(stmt) > 1) ? sqlite3_column_int(stmt, 1) : DISP_LOCATION_GAMES;
+        if (!t) continue;
+        if (count >= cap) {
+            int new_cap = (cap == 0) ? 128 : cap * 2;
+            TitleLocEntry *nb = realloc(*out_items, (size_t)new_cap * sizeof(TitleLocEntry));
+            if (!nb) break;
+            *out_items = nb;
+            cap = new_cap;
+        }
+        strncpy((*out_items)[count].tid, t, 15);
+        (*out_items)[count].tid[15] = '\0';
+        (*out_items)[count].loc = (l == DISP_LOCATION_MEDIA) ? DISP_LOCATION_MEDIA : DISP_LOCATION_GAMES;
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static int execute_smart_tidy(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MAX_USER_PROFILES][32], int uid_count) {
     const char *homebrew_prefixes[] = { "PLDM", "PMNT", "FMGR", "WKAL", "FAKE", "ITEM", "LAPY", "PPSA99", NULL };
     const char *bloat_ids[] = { "NPXS40047", "NPXS40037", "NPXS40053", "NPXS40054", "NPXS40032", NULL };
 
-    char tid_list[256][16];
-    int tid_count = 0;
-    if (sqlite3_prepare_v2(app_db, "SELECT titleId FROM tbl_contentinfo WHERE titleId != 'TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW && tid_count < 256) {
-            const char *t = (const char *)sqlite3_column_text(stmt, 0);
-            if (t) {
-                strncpy(tid_list[tid_count], t, 15);
-                tid_list[tid_count][15] = '\0';
-                tid_count++;
-            }
-        }
-        sqlite3_finalize(stmt);
-    }
+    TitleLocEntry *entries = NULL;
+    int tid_count = collect_content_titles(app_db, "SELECT titleId FROM tbl_contentinfo WHERE titleId != 'TBSH00001';", &entries);
 
     sqlite3_exec(app_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (appinfo_db) sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
 
     for (int i = 0; i < tid_count; i++) {
         for (int p = 0; homebrew_prefixes[p] != NULL; p++) {
-            if (strncmp(tid_list[i], homebrew_prefixes[p], strlen(homebrew_prefixes[p])) == 0) {
-                internal_shift_single(app_db, appinfo_db, uids, uid_count, tid_list[i], DISP_LOCATION_MEDIA);
+            if (strncmp(entries[i].tid, homebrew_prefixes[p], strlen(homebrew_prefixes[p])) == 0) {
+                internal_shift_single(app_db, appinfo_db, uids, uid_count, entries[i].tid, DISP_LOCATION_MEDIA);
                 break;
             }
         }
     }
+    free(entries);
 
     for (int b = 0; bloat_ids[b] != NULL; b++) {
         internal_set_visibility(app_db, appinfo_db, uids, uid_count, bloat_ids[b], true);
@@ -1057,31 +1085,17 @@ static int execute_smart_tidy(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MA
 static int repair_all_padlocks(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr, char uids[MAX_USER_PROFILES][32], int uid_count) {
     sqlite3 *app_db = *app_db_ptr;
     sqlite3 *appinfo_db = *appinfo_db_ptr;
-    sqlite3_stmt *stmt;
-    char tids[512][16];
-    int locs[512];
-    int count = 0;
 
-    if (sqlite3_prepare_v2(app_db, "SELECT titleId, dispLocation FROM tbl_contentinfo WHERE titleId NOT LIKE 'NPXS%' AND titleId != 'TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW && count < 512) {
-            const char *t = (const char *)sqlite3_column_text(stmt, 0);
-            int l = sqlite3_column_int(stmt, 1);
-            if (t) {
-                strncpy(tids[count], t, 15);
-                tids[count][15] = '\0';
-                locs[count] = (l == DISP_LOCATION_MEDIA) ? DISP_LOCATION_MEDIA : DISP_LOCATION_GAMES;
-                count++;
-            }
-        }
-        sqlite3_finalize(stmt);
-    }
+    TitleLocEntry *entries = NULL;
+    int count = collect_content_titles(app_db, "SELECT titleId, dispLocation FROM tbl_contentinfo WHERE titleId NOT LIKE 'NPXS%' AND titleId != 'TBSH00001';", &entries);
 
     sqlite3_exec(app_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (appinfo_db) sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
 
     for (int i = 0; i < count; i++) {
-        internal_shift_single(app_db, appinfo_db, uids, uid_count, tids[i], locs[i]);
+        internal_shift_single(app_db, appinfo_db, uids, uid_count, entries[i].tid, entries[i].loc);
     }
+    free(entries);
 
     if (appinfo_db) sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL);
     sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL);
@@ -1250,9 +1264,10 @@ static const char *WEB_UI_HTML =
 "</style></head><body>"
 "<div id='update-banner'>"
 "  <div class='ub-row'>"
-"    <div><strong>New Update Available:</strong> <span id='ub-ver'></span></div>"
+"    <div><strong>New Update Available:</strong> <span id='ub-ver'></span><span id='ub-note' style='font-size:12px;color:#b8d0eb;margin-left:8px'></span></div>"
 "    <div class='ub-actions'>"
 "      <button type='button' class='btn' id='ub-chg-btn' onclick='toggleChangelog()'>What&#39;s New (v)</button>"
+"      <a class='btn' id='ub-dl-link' style='display:none;text-decoration:none' target='_blank' rel='noopener'>Download .elf</a>"
 "      <button type='button' class='btn btn-primary' id='ub-install-btn' onclick='runSelfUpdate()'>Update Now</button>"
 "    </div>"
 "  </div>"
@@ -1266,6 +1281,8 @@ static const char *WEB_UI_HTML =
 "      <button type='button' class='btn btn-primary' onclick='smartTidy()'>Smart Tidy</button>"
 "      <button type='button' class='btn btn-warn' onclick='fixPadlocks()'>Fix Padlocks</button>"
 "      <button type='button' class='btn btn-danger' onclick='restoreOriginalDb()'>Restore DB Backup</button>"
+"      <input type='file' id='elf-file-input' accept='.elf' style='display:none' onchange='uploadLocalElf(this)'>"
+"      <button type='button' class='btn' id='upload-elf-btn' onclick='document.getElementById(\"elf-file-input\").click()'>Upload .elf</button>"
 "      <button type='button' class='btn btn-primary' id='tile-btn' style='display:none' onclick='installTile()'>Add Media Tile</button>"
 "      <button type='button' class='btn btn-danger' onclick='uninstallTabShifter()'>Uninstall</button>"
 "    </div>"
@@ -1292,6 +1309,7 @@ static const char *WEB_UI_HTML =
 "let APPS=[];let FILTER='all';let QUEUE=[];let LATEST_ELF_URL='';"
 "function showToast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2600);}"
 "async function loadApps(){const res=await fetch('/api/apps');APPS=await res.json();renderList();}"
+"function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}"
 "function isHomebrew(tid){return /^(PLDM|PMNT|FMGR|WKAL|FAKE|ITEM|LAPY|PPSA99|TBSH)/.test(tid);}"
 "function setFilter(f,el){FILTER=f;document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');renderList();}"
 "function locLabel(loc){if(loc===138)return '<span class=\"loc-tag loc-138\">GAMES</span>';if(loc===188)return '<span class=\"loc-tag loc-188\">MEDIA</span>';return '<span class=\"loc-tag loc-1\">HIDDEN</span>';}"
@@ -1319,20 +1337,21 @@ static const char *WEB_UI_HTML =
 "    const hideTxt=isHid?'Unhide':'Hide';"
 "    const pinAct=a.pinned===1?'unpin':'pin';"
 "    const pinTxt=a.pinned===1?'Unpin':'Pin';"
-"    return `<div class='app-card ${a.queued?\"queued\":\"\"}' id='card-${a.tid}'>"
+"    const tidEsc=escHtml(a.tid);"
+"    return `<div class='app-card ${a.queued?\"queued\":\"\"}' id='card-${tidEsc}'>"
 "      <div class='app-left'>"
 "        <div class='app-info'>"
 "          <div class='app-title-row'>"
-"            <span class='app-title'>${a.title}</span>"
+"            <span class='app-title'>${escHtml(a.title)}</span>"
 "            ${locLabel(a.loc)} ${pinBadge} ${qBadge}"
 "          </div>"
-"          <div class='app-tid'>${a.tid}</div>"
+"          <div class='app-tid'>${tidEsc}</div>"
 "        </div>"
 "      </div>"
 "      <div class='app-actions'>"
-"        <button type='button' class='btn btn-primary' onclick='queueOp(\"${a.tid}\",\"${nextTab}\")'>${nextTabTxt}</button>"
-"        <button type='button' class='btn' onclick='queueOp(\"${a.tid}\",\"${pinAct}\")'>${pinTxt}</button>"
-"        <button type='button' class='btn' onclick='queueOp(\"${a.tid}\",\"${hideAct}\")'>${hideTxt}</button>"
+"        <button type='button' class='btn btn-primary' onclick='queueOp(\"${tidEsc}\",\"${nextTab}\")'>${nextTabTxt}</button>"
+"        <button type='button' class='btn' onclick='queueOp(\"${tidEsc}\",\"${pinAct}\")'>${pinTxt}</button>"
+"        <button type='button' class='btn' onclick='queueOp(\"${tidEsc}\",\"${hideAct}\")'>${hideTxt}</button>"
 "      </div>"
 "    </div>`;"
 "  }).join('');"
@@ -1356,11 +1375,12 @@ static const char *WEB_UI_HTML =
 "async function applyAndReload(){"
 "  const btn=document.getElementById('apply-btn');"
 "  btn.textContent='Applying & Reloading UI...';btn.disabled=true;"
-"  await fetch('/api/apply-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ops:QUEUE})});"
-"  QUEUE=[];"
-"  await loadApps();"
-"  btn.innerHTML='Apply &amp; Reload PS5 UI (<span id=\"q-count\">0</span>)';btn.disabled=false;"
-"  showToast('Changes applied & UI reloaded!');"
+"  try{"
+"    const res=await fetch('/api/apply-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ops:QUEUE})});"
+"    if(!res.ok)throw new Error('HTTP '+res.status);"
+"    QUEUE=[];await loadApps();showToast('Changes applied & UI reloaded!');"
+"  }catch(e){showToast('Apply failed — please try again.');}"
+"  finally{btn.innerHTML='Apply &amp; Reload PS5 UI (<span id=\"q-count\">0</span>)';btn.disabled=false;document.getElementById('q-count').textContent=QUEUE.length;}"
 "}"
 "async function smartTidy(){"
 "  if(confirm('Auto-move all Homebrew to Media Tab, hide PSN bloatware, and reload PS5 UI?')){"
@@ -1392,9 +1412,6 @@ static const char *WEB_UI_HTML =
 "  const res=await fetch('/api/install-tile',{method:'POST'});"
 "  if(res.ok){document.getElementById('tile-btn').style.display='none';showToast('TabShifter tile added & PS5 UI reloaded!');}"
 "}"
-"async function checkTile(){"
-"  try{const v=await fetch('/api/version').then(r=>r.json());if(v.tile===false)document.getElementById('tile-btn').style.display='inline-block';}catch(e){}"
-"}"
 "function toggleChangelog(){"
 "  const d=document.getElementById('changelog-drawer');"
 "  const b=document.getElementById('ub-chg-btn');"
@@ -1408,9 +1425,10 @@ static const char *WEB_UI_HTML =
 "  for(let i=0;i<3;i++){if((r[i]||0)>(l[i]||0))return true;if((r[i]||0)<(l[i]||0))return false;}"
 "  return false;"
 "}"
-"async function checkGitHubUpdate(){"
+"async function initMeta(){"
 "  try{"
 "    const vRes=await fetch('/api/version').then(r=>r.json());"
+"    if(vRes.tile===false)document.getElementById('tile-btn').style.display='inline-block';"
 "    const gh=await fetch('https://api.github.com/repos/xvvulcanvx/PS5-TabShifter/releases/latest').then(r=>r.json());"
 "    if(!gh || !gh.tag_name)return;"
 "    if(isNewerVersion(gh.tag_name,vRes.version)){"
@@ -1418,24 +1436,44 @@ static const char *WEB_UI_HTML =
 "      if(asset){"
 "        LATEST_ELF_URL=asset.browser_download_url;"
 "        document.getElementById('ub-ver').textContent=gh.tag_name;"
+"        const dl=document.getElementById('ub-dl-link');dl.href=LATEST_ELF_URL;"
 "        document.getElementById('changelog-drawer').textContent=gh.body||'New release available.';"
 "        document.getElementById('update-banner').style.display='block';"
 "      }"
 "    }"
 "  }catch(e){}"
 "}"
+"async function postElfBinary(blob,btn,idleLabel){"
+"  btn.textContent='Installing...';btn.disabled=true;"
+"  try{"
+"    const up=await fetch('/api/update-payload',{method:'POST',body:blob});"
+"    if(up.ok){showToast('Update installed! Re-launch payload to apply.');btn.textContent='Updated!';}"
+"    else{showToast('Invalid ELF or write failed.');btn.textContent=idleLabel;btn.disabled=false;}"
+"  }catch(e){showToast('Upload failed.');btn.textContent=idleLabel;btn.disabled=false;}"
+"}"
 "async function runSelfUpdate(){"
 "  if(!LATEST_ELF_URL)return;"
 "  const btn=document.getElementById('ub-install-btn');btn.textContent='Downloading...';btn.disabled=true;"
 "  try{"
-"    const blob=await fetch(LATEST_ELF_URL).then(r=>r.blob());"
-"    btn.textContent='Installing...';"
-"    const up=await fetch('/api/update-payload',{method:'POST',body:blob});"
-"    if(up.ok){showToast('Update installed! Re-launch payload.');btn.textContent='Updated!';}"
-"    else{btn.textContent='Update Failed';btn.disabled=false;}"
-"  }catch(e){btn.textContent='Error';btn.disabled=false;}"
+"    const res=await fetch(LATEST_ELF_URL);"
+"    if(!res.ok)throw new Error('HTTP '+res.status);"
+"    const blob=await res.blob();"
+"    await postElfBinary(blob,btn,'Update Now');"
+"  }catch(e){"
+"    document.getElementById('ub-dl-link').style.display='inline-block';"
+"    document.getElementById('ub-note').textContent='Direct download blocked by CORS — click Download .elf, then Upload .elf.';"
+"    btn.textContent='Retry Update';btn.disabled=false;"
+"    showToast('Download .elf then use Upload .elf to install.');"
+"  }"
 "}"
-"loadApps();checkTile();checkGitHubUpdate();"
+"async function uploadLocalElf(input){"
+"  const file=input&&input.files&&input.files[0];"
+"  if(!file)return;"
+"  const btn=document.getElementById('upload-elf-btn');"
+"  await postElfBinary(file,btn,'Upload .elf');"
+"  input.value='';"
+"}"
+"loadApps();initMeta();"
 "</script></body></html>";
 
 /* ========================================================================= */
@@ -1477,22 +1515,52 @@ static char *build_apps_json(sqlite3 *app_db, const char *primary_uid) {
             int vis           = sqlite3_column_int(stmt, 4);
 
             if (!tid) continue;
-            char esc_name[256];
+            char esc_tid[64], esc_name[256];
+            json_escape_str(tid, esc_tid, sizeof(esc_tid));
             json_escape_str(tname ? tname : tid, esc_name, sizeof(esc_name));
 
             if (len + 512 >= cap) {
-                cap *= 2;
-                buf = realloc(buf, cap);
+                size_t new_cap = cap * 2;
+                char *nbuf = realloc(buf, new_cap);
+                if (!nbuf) {
+                    free(buf);
+                    sqlite3_finalize(stmt);
+                    return NULL;
+                }
+                buf = nbuf;
+                cap = new_cap;
             }
             len += (size_t)snprintf(buf + len, cap - len,
                                     "%s{\"tid\":\"%s\",\"title\":\"%s\",\"loc\":%d,\"pinned\":%d,\"visible\":%d}",
-                                    first ? "" : ",", tid, esc_name, loc, pinned, vis);
+                                    first ? "" : ",", esc_tid, esc_name, loc, pinned, vis);
             first = false;
         }
         sqlite3_finalize(stmt);
     }
     snprintf(buf + len, cap - len, "]");
     return buf;
+}
+
+static bool extract_json_str_field(const char *start, const char *key, char *out, size_t max_len, const char **next_pos) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(start, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return false;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '\"') return false;
+    p++;
+    size_t i = 0;
+    while (p[i] && p[i] != '\"' && i < max_len - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    *next_pos = p + i + (p[i] == '\"' ? 1 : 0);
+    return true;
 }
 
 static void handle_apply_queue_json(sqlite3 *app_db, sqlite3 *appinfo_db,
@@ -1504,20 +1572,9 @@ static void handle_apply_queue_json(sqlite3 *app_db, sqlite3 *appinfo_db,
     if (appinfo_db) sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
 
     const char *p = body;
-    while ((p = strstr(p, "\"tid\":\"")) != NULL) {
-        p += 7;
-        char tid[32] = {0};
-        size_t i = 0;
-        while (p[i] && p[i] != '\"' && i < sizeof(tid) - 1) { tid[i] = p[i]; i++; }
-        p += i;
-
-        const char *act_p = strstr(p, "\"action\":\"");
-        if (!act_p) break;
-        act_p += 10;
-        char action[32] = {0};
-        size_t j = 0;
-        while (act_p[j] && act_p[j] != '\"' && j < sizeof(action) - 1) { action[j] = act_p[j]; j++; }
-        p = act_p + j;
+    char tid[32], action[32];
+    while (extract_json_str_field(p, "tid", tid, sizeof(tid), &p)) {
+        if (!extract_json_str_field(p, "action", action, sizeof(action), &p)) break;
 
         if (tid[0] != '\0' && action[0] != '\0') {
             if (strcmp(action, "media") == 0)       internal_shift_single(app_db, appinfo_db, uids, uid_count, tid, DISP_LOCATION_MEDIA);
@@ -1549,40 +1606,75 @@ static void send_http_response(int client_fd, int status, const char *content_ty
     if (body && body_len > 0) send(client_fd, body, body_len, 0);
 }
 
+static size_t extract_content_length(const char *hdr_start, const char *hdr_end) {
+    const char *key = "content-length:";
+    size_t klen = 15;
+    const char *line = hdr_start;
+    while (line < hdr_end) {
+        if ((size_t)(hdr_end - line) >= klen) {
+            bool match = true;
+            for (size_t k = 0; k < klen; k++) {
+                char c = line[k];
+                if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+                if (c != key[k]) { match = false; break; }
+            }
+            if (match) return (size_t)strtoul(line + klen, NULL, 10);
+        }
+        const char *nl = memchr(line, '\n', (size_t)(hdr_end - line));
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return 0;
+}
+
 static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr,
                                char uids[MAX_USER_PROFILES][32], int uid_count) {
     sqlite3 *app_db = *app_db_ptr;
     sqlite3 *appinfo_db = *appinfo_db_ptr;
 
+    const size_t max_upload = 32 * 1024 * 1024;
     size_t cap = 65536;
     uint8_t *req = malloc(cap);
     if (!req) { close(client_fd); return true; }
 
-    ssize_t received = recv(client_fd, req, cap - 1, 0);
-    if (received <= 0) { free(req); close(client_fd); return true; }
-    req[received] = '\0';
-
-    size_t content_len = 0;
-    const char *cl_hdr = strstr((char *)req, "Content-Length:");
-    if (!cl_hdr) cl_hdr = strstr((char *)req, "content-length:");
-    if (cl_hdr) content_len = (size_t)strtoul(cl_hdr + 15, NULL, 10);
-
-    uint8_t *body_ptr = (uint8_t *)strstr((char *)req, "\r\n\r\n");
-    if (body_ptr) {
-        body_ptr += 4;
-        size_t header_bytes = (size_t)(body_ptr - req);
-        size_t total_needed = header_bytes + content_len;
-        if (total_needed > cap && total_needed < 32 * 1024 * 1024) {
-            req = realloc(req, total_needed + 1);
-            body_ptr = req + header_bytes;
-        }
-        while ((size_t)received < total_needed) {
-            ssize_t r = recv(client_fd, req + received, total_needed - (size_t)received, 0);
-            if (r <= 0) break;
-            received += r;
-        }
+    size_t received = 0;
+    uint8_t *body_ptr = NULL;
+    while (received < cap - 1) {
+        ssize_t r = recv(client_fd, req + received, cap - 1 - received, 0);
+        if (r <= 0) break;
+        received += (size_t)r;
         req[received] = '\0';
+        char *hdr_end = strstr((char *)req, "\r\n\r\n");
+        if (hdr_end) {
+            body_ptr = (uint8_t *)hdr_end + 4;
+            break;
+        }
     }
+    if (received == 0 || !body_ptr) { free(req); close(client_fd); return true; }
+
+    size_t header_bytes = (size_t)(body_ptr - req);
+    size_t content_len = extract_content_length((const char *)req, (const char *)body_ptr);
+    if (content_len > max_upload - header_bytes) {
+        send_http_response(client_fd, 413, "application/json", "{\"ok\":false}", 12);
+        free(req);
+        close(client_fd);
+        return true;
+    }
+
+    size_t total_needed = header_bytes + content_len;
+    if (total_needed > cap - 1) {
+        uint8_t *nreq = realloc(req, total_needed + 1);
+        if (!nreq) { free(req); close(client_fd); return true; }
+        req = nreq;
+        body_ptr = req + header_bytes;
+    }
+    while (received < total_needed) {
+        ssize_t r = recv(client_fd, req + received, total_needed - received, 0);
+        if (r <= 0) break;
+        received += (size_t)r;
+    }
+    req[received] = '\0';
+    bool body_complete = (received >= total_needed);
 
     if (strncmp((char *)req, "POST /api/shutdown", 18) == 0) {
         send_http_response(client_fd, 200, "text/plain", "BYE", 3);
@@ -1622,8 +1714,10 @@ static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **ap
         if (ajson) {
             send_http_response(client_fd, 200, "application/json", ajson, strlen(ajson));
             free(ajson);
+        } else {
+            send_http_response(client_fd, 500, "application/json", "[]", 2);
         }
-    } else if (strncmp((char *)req, "POST /api/apply-queue", 21) == 0 && body_ptr) {
+    } else if (strncmp((char *)req, "POST /api/apply-queue", 21) == 0 && body_complete) {
         handle_apply_queue_json(app_db, appinfo_db, uids, uid_count, (const char *)body_ptr);
         send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strncmp((char *)req, "POST /api/smart-tidy", 20) == 0) {
@@ -1642,13 +1736,17 @@ static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **ap
         } else {
             send_http_response(client_fd, 500, "application/json", "{\"ok\":false}", 12);
         }
-    } else if (strncmp((char *)req, "POST /api/update-payload", 24) == 0 && body_ptr && content_len > 0) {
-        int rc = apply_self_update(body_ptr, content_len);
-        if (rc == 0) {
-            notify_ps5("TabShifter Updated!\nRe-launch payload to apply.");
-            send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strncmp((char *)req, "POST /api/update-payload", 24) == 0 && content_len > 0) {
+        if (!body_complete) {
+            send_http_response(client_fd, 400, "application/json", "{\"ok\":false}", 12);
         } else {
-            send_http_response(client_fd, 500, "application/json", "{\"ok\":false}", 12);
+            int rc = apply_self_update(body_ptr, content_len);
+            if (rc == 0) {
+                notify_ps5("TabShifter Updated!\nRe-launch payload to apply.");
+                send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
+            } else {
+                send_http_response(client_fd, 500, "application/json", "{\"ok\":false}", 12);
+            }
         }
     } else {
         send_http_response(client_fd, 404, "text/plain", "Not Found", 9);
