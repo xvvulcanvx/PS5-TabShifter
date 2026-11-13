@@ -13,8 +13,8 @@ A lightweight on-console utility and web interface for jailbroken PlayStation 5 
 * **Pin Icons to Home Screen:** Pin or unpin any app to lock your favorite titles onto the primary home bar so they never get pushed into the Game Library.
 * **No-Scroll-Jump Web UI:** Viewport stays locked in place while queueing changes. Includes instant search, quick filter pills (All, Games, Media, Hidden, PS5, PS4, Homebrew), and a 1-click **Smart Tidy** button.
 * **One-Click Padlock Repair:** Built-in recovery tool to instantly repair concept bitmasks across your entire library if another tool caused padlock icons on your games.
-* **In-App Self-Updater:** Automatically checks GitHub Releases for new updates, displays release notes, and updates the payload directly on the console.
-* **100% On-Console Operation:** Automatically installs the TabShifter ("TS") launcher tile directly onto your Media tab. Startup checks prevent black-screen shell reloads when re-launching.
+* **In-App Updater & Local `.elf` Upload:** Automatically checks GitHub Releases for new updates, displays release notes, and lets you install `TabShifter.elf` directly through the Web UI (**Upload .elf**) without FTP.
+* **100% On-Console Operation & Clean Uninstall:** Automatically installs the TabShifter ("TS") launcher tile on your Media tab (`TBSH00001`). Supports native Home Screen **Options -> Delete** and a Web UI **Uninstall** button that permanently removes the tile without touching your app layout or backups.
 
 ---
 
@@ -39,6 +39,15 @@ TabShifter updates all database layers simultaneously, applies the correct conce
 4. Launch TabShifter from your **Media** tab (or open `http://<PS5_IP>:9095/` in any browser on your network).
 5. Queue your changes, then click **Apply & Reload PS5 UI** at the top.
 
+#### Upgrading from v1.3.0 to v1.4.0
+> **Note:** Clicking **Update Now** inside **v1.3.0** will fail with **`Error`** because GitHub's release asset downloads (`github.com` / `release-assets.githubusercontent.com`) do not send CORS headers for browser `fetch()`. To upgrade from v1.3.0 to v1.4.0 once:
+> * Replace `TabShifter.elf` via Payload Manager or FTP, **or**
+> * While `v1.3.0` is open on your PS5, push the downloaded `v1.4.0` binary from a PC/terminal without FTP:
+>   ```bash
+>   curl -X POST --data-binary @TabShifter.elf http://<PS5_IP>:9095/api/update-payload
+>   ```
+> * Re-launch the payload on your PS5. From **v1.4.0** onward, you can use the **Download .elf** / **Upload .elf** buttons directly in the Web UI.
+
 ---
 
 ### Database Recovery & Safety
@@ -51,7 +60,7 @@ TabShifter creates safety backups on first initialization:
 If you ever need to restore your layout:
 
 * **Fix Padlocks:** Click the orange **Fix Padlocks** button in the Web UI to restore concept bitmasks if game icons are locked.
-* **Full Restore:** Click **Restore DB Backup** in the Web UI to revert back to your untouched original databases.
+* **Restore DB Backup:** Click **Restore DB Backup** in the Web UI to revert original tab layout and visibility in-place while keeping PS4 FPKGs and apps installed after the initial backup intact.
 
 ---
 
