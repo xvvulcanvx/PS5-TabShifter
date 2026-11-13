@@ -16,11 +16,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sqlite3.h>
+#include <ps5/kernel.h>
 
-#define TABSHIFTER_VERSION      "1.3.0"
+#define TABSHIFTER_VERSION      "1.4.0"
 #define HTTP_PORT               9095
 #define TBSH_TITLE_ID           "TBSH00001"
 #define DEFAULT_ELF_FALLBACK    "/data/pldmgr/payloads/TabShifter.elf"
+
+#define TBSH_STATE_DIR          "/data/tabshifter"
+#define TBSH_REMOVED_MARKER     TBSH_STATE_DIR "/tile_removed"
 
 #define APP_DB_PATH             "/system_data/priv/mms/app.db"
 #define APPINFO_DB_PATH         "/system_data/priv/mms/appinfo.db"
@@ -348,16 +352,23 @@ static int get_all_user_ids(sqlite3 *db, char uids[MAX_USER_PROFILES][32]) {
     return count;
 }
 
-static bool table_exists(sqlite3 *db, const char *table_name) {
+static bool schema_table_exists(sqlite3 *db, const char *schema, const char *table_name) {
     sqlite3_stmt *stmt;
     bool exists = false;
-    const char *sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
-        if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
-        sqlite3_finalize(stmt);
+    char *sql = sqlite3_mprintf("SELECT 1 FROM \"%w\".sqlite_master WHERE type='table' AND name = ?;", schema);
+    if (sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
+            if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_free(sql);
     }
     return exists;
+}
+
+static bool table_exists(sqlite3 *db, const char *table_name) {
+    return schema_table_exists(db, "main", table_name);
 }
 
 static void copy_file_if_missing(const char *src_path, const char *dst_path) {
@@ -377,9 +388,72 @@ static void copy_file_if_missing(const char *src_path, const char *dst_path) {
     fclose(src);
 }
 
+static void backup_sqlite_if_missing(const char *src_path, const char *dst_path) {
+    struct stat st;
+    if (stat(dst_path, &st) == 0 && st.st_size > 0) return;
+
+    sqlite3 *src_db = NULL;
+    sqlite3 *dst_db = NULL;
+    bool ok = false;
+
+    if (sqlite3_open_v2(src_path, &src_db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_busy_timeout(src_db, SQLITE_BUSY_TIMEOUT_MS);
+        sqlite3_exec(src_db, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
+        if (sqlite3_open_v2(dst_path, &dst_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK) {
+            sqlite3_exec(dst_db, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+            sqlite3_backup *bk = sqlite3_backup_init(dst_db, "main", src_db, "main");
+            if (bk) {
+                int rc = sqlite3_backup_step(bk, -1);
+                int frc = sqlite3_backup_finish(bk);
+                ok = (rc == SQLITE_DONE && frc == SQLITE_OK);
+            }
+        }
+    }
+    if (dst_db) sqlite3_close(dst_db);
+    if (src_db) sqlite3_close(src_db);
+
+    if (!ok) {
+        unlink(dst_path);
+        copy_file_if_missing(src_path, dst_path);
+    }
+}
+
 static void create_initial_db_backups_once(void) {
-    copy_file_if_missing(APP_DB_PATH, "/system_data/priv/mms/app.db.tabshifter.bak");
-    copy_file_if_missing(APPINFO_DB_PATH, "/system_data/priv/mms/appinfo.db.tabshifter.bak");
+    backup_sqlite_if_missing(APP_DB_PATH, "/system_data/priv/mms/app.db.tabshifter.bak");
+    backup_sqlite_if_missing(APPINFO_DB_PATH, "/system_data/priv/mms/appinfo.db.tabshifter.bak");
+}
+
+static bool open_mms_databases(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr) {
+    if (sqlite3_open(APP_DB_PATH, app_db_ptr) != SQLITE_OK) {
+        if (*app_db_ptr) {
+            sqlite3_close(*app_db_ptr);
+            *app_db_ptr = NULL;
+        }
+        *appinfo_db_ptr = NULL;
+        return false;
+    }
+    sqlite3_busy_timeout(*app_db_ptr, SQLITE_BUSY_TIMEOUT_MS);
+    sqlite3_exec(*app_db_ptr, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
+
+    if (sqlite3_open(APPINFO_DB_PATH, appinfo_db_ptr) == SQLITE_OK) {
+        sqlite3_busy_timeout(*appinfo_db_ptr, SQLITE_BUSY_TIMEOUT_MS);
+        sqlite3_exec(*appinfo_db_ptr, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
+    } else {
+        if (*appinfo_db_ptr) sqlite3_close(*appinfo_db_ptr);
+        *appinfo_db_ptr = NULL;
+    }
+    return true;
+}
+
+static void close_mms_databases(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr) {
+    if (*appinfo_db_ptr) {
+        sqlite3_close(*appinfo_db_ptr);
+        *appinfo_db_ptr = NULL;
+    }
+    if (*app_db_ptr) {
+        sqlite3_close(*app_db_ptr);
+        *app_db_ptr = NULL;
+    }
 }
 
 /* ========================================================================= */
@@ -421,10 +495,119 @@ static char *update_concept_info_json(const char *json_in, int new_disp_loc) {
 }
 
 /* ========================================================================= */
-/*     TBSH00001 DASHBOARD TILE & "TS" ICON INSTALLER (EXACT V1.2.1 SQL)     */
+/*          TBSH00001 DASHBOARD TILE INSTALLER & FULL UNINSTALLER            */
 /* ========================================================================= */
 
+extern int sceAppInstUtilInitialize(void);
+extern int sceAppInstUtilTerminate(void);
+extern int sceAppInstUtilAppInstallAll(void *);
+extern int sceAppInstUtilAppUnInstall(const char *);
+
+static int appinst_init_with_authid(uint64_t *saved_authid, bool *changed_authid) {
+    *changed_authid = false;
+    int err = sceAppInstUtilInitialize();
+    if (err != 0) {
+        *saved_authid = kernel_get_ucred_authid(-1);
+        if (*saved_authid != 0x4801000000000013ULL &&
+            kernel_set_ucred_authid(-1, 0x4801000000000013ULL) == 0) {
+            *changed_authid = true;
+            err = sceAppInstUtilInitialize();
+            if (err != 0) {
+                kernel_set_ucred_authid(-1, *saved_authid);
+                *changed_authid = false;
+            }
+        }
+    }
+    return err;
+}
+
+static void appinst_fini_with_authid(uint64_t saved_authid, bool changed_authid) {
+    sceAppInstUtilTerminate();
+    if (changed_authid) {
+        kernel_set_ucred_authid(-1, saved_authid);
+    }
+}
+
+static int appinst_install_title_dir(const char *title_id, const char *dir) {
+    int (*fn)(const char *, const char *, void *) = NULL;
+    uint32_t handle = 0;
+    if (!kernel_dynlib_handle(-1, "libSceAppInstUtil.sprx", &handle)) {
+        fn = (int (*)(const char *, const char *, void *))kernel_dynlib_resolve(-1, handle, "Wudg3Xe3heE");
+    }
+    if (fn) {
+        return fn(title_id, dir, NULL);
+    }
+    return sceAppInstUtilAppInstallAll(NULL);
+}
+
+static bool is_tile_removal_requested(void) {
+    struct stat st;
+    return stat(TBSH_REMOVED_MARKER, &st) == 0;
+}
+
+static void set_tile_removal_marker(bool removed) {
+    if (removed) {
+        mkdir(TBSH_STATE_DIR, 0777);
+        FILE *fp = fopen(TBSH_REMOVED_MARKER, "wb");
+        if (fp) fclose(fp);
+    } else {
+        unlink(TBSH_REMOVED_MARKER);
+    }
+}
+
+static bool tbsh_tile_row_exists(sqlite3 *app_db) {
+    if (!app_db) return false;
+    sqlite3_stmt *stmt;
+    bool exists = false;
+    if (sqlite3_prepare_v2(app_db, "SELECT 1 FROM tbl_contentinfo WHERE titleId='TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
+        sqlite3_finalize(stmt);
+    }
+    return exists;
+}
+
+static bool tbsh_has_db_or_meta_remnants(sqlite3 *app_db, sqlite3 *appinfo_db) {
+    if (tbsh_tile_row_exists(app_db)) return true;
+
+    if (appinfo_db) {
+        sqlite3_stmt *stmt;
+        bool exists = false;
+        if (sqlite3_prepare_v2(appinfo_db, "SELECT 1 FROM tbl_appinfo WHERE titleId='TBSH00001' LIMIT 1;", -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
+            sqlite3_finalize(stmt);
+        }
+        if (exists) return true;
+    }
+
+    struct stat st;
+    if (stat("/user/appmeta/TBSH00001", &st) == 0) return true;
+    if (stat("/system_data/priv/appmeta/TBSH00001", &st) == 0) return true;
+    return false;
+}
+
+static void remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                char child[512];
+                snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+                remove_tree(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
 static bool is_tbsh_tile_already_installed(sqlite3 *app_db) {
+    if (!app_db) return false;
     sqlite3_stmt *stmt;
     int loc = 0;
     if (sqlite3_prepare_v2(app_db, "SELECT dispLocation FROM tbl_contentinfo WHERE titleId='TBSH00001';", -1, &stmt, NULL) == SQLITE_OK) {
@@ -438,7 +621,38 @@ static bool is_tbsh_tile_already_installed(sqlite3 *app_db) {
     return (loc == 188 && icon_ok);
 }
 
-static void install_tabshifter_launcher(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MAX_USER_PROFILES][32], int uid_count) {
+static void install_tabshifter_launcher(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr,
+                                        char uids[MAX_USER_PROFILES][32], int uid_count) {
+    /* Try native SceAppInstUtil installation first so PS5 Home Screen Delete works cleanly. */
+    close_mms_databases(app_db_ptr, appinfo_db_ptr);
+
+    int inst_rc = -1;
+    uint64_t saved_authid = 0;
+    bool changed_authid = false;
+    if (appinst_init_with_authid(&saved_authid, &changed_authid) == 0) {
+        sceAppInstUtilAppUnInstall(TBSH_TITLE_ID);
+
+        mkdir("/user/app/TBSH00001", 0777);
+        mkdir("/user/app/TBSH00001/sce_sys", 0777);
+        generate_ts_icon_png("/user/app/TBSH00001/sce_sys/icon0.png");
+        write_tbsh_param_json("/user/app/TBSH00001/sce_sys/param.json");
+
+        inst_rc = appinst_install_title_dir(TBSH_TITLE_ID, "/user/app/");
+        appinst_fini_with_authid(saved_authid, changed_authid);
+    }
+
+    if (!open_mms_databases(app_db_ptr, appinfo_db_ptr)) {
+        return;
+    }
+
+    if (inst_rc == 0 && tbsh_tile_row_exists(*app_db_ptr)) {
+        return;
+    }
+
+    /* Fallback: direct SQLite registration (FW 5.00 - 13.60) if SceAppInstUtil failed */
+    sqlite3 *app_db = *app_db_ptr;
+    sqlite3 *appinfo_db = *appinfo_db_ptr;
+
     mkdir("/user/app/TBSH00001", 0777);
     mkdir("/user/app/TBSH00001/sce_sys", 0777);
     mkdir("/user/appmeta/TBSH00001", 0777);
@@ -525,6 +739,68 @@ static void install_tabshifter_launcher(sqlite3 *app_db, sqlite3 *appinfo_db, ch
     }
 }
 
+static void uninstall_tabshifter_launcher(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr,
+                                          char uids[MAX_USER_PROFILES][32], int uid_count) {
+    /* 1. Try native SceAppInstUtil uninstall first if registered with the OS */
+    close_mms_databases(app_db_ptr, appinfo_db_ptr);
+
+    uint64_t saved_authid = 0;
+    bool changed_authid = false;
+    if (appinst_init_with_authid(&saved_authid, &changed_authid) == 0) {
+        sceAppInstUtilAppUnInstall(TBSH_TITLE_ID);
+        appinst_fini_with_authid(saved_authid, changed_authid);
+    }
+
+    /* 2. Reopen DBs and purge any remaining SQL rows (covers legacy SQL-injected installs) */
+    if (open_mms_databases(app_db_ptr, appinfo_db_ptr)) {
+        sqlite3 *app_db = *app_db_ptr;
+        sqlite3 *appinfo_db = *appinfo_db_ptr;
+
+        /* One statement per exec so an optional table missing on a given firmware does not abort the rest */
+        sqlite3_exec(app_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+        sqlite3_exec(app_db, "DELETE FROM tbl_contentinfo WHERE titleId='TBSH00001';", NULL, NULL, NULL);
+        sqlite3_exec(app_db, "DELETE FROM tbl_conceptmetadata WHERE localConceptId='cid:local:TBSH00001';", NULL, NULL, NULL);
+
+        for (int i = 0; i < uid_count; i++) {
+            char *q = sqlite3_mprintf("DELETE FROM tbl_iconinfo_%s WHERE titleId='TBSH00001';", uids[i]);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+
+            q = sqlite3_mprintf("DELETE FROM tbl_concepticoninfo_%s WHERE primaryTitleId='TBSH00001' OR localConceptId='cid:local:TBSH00001';", uids[i]);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+
+            char tbl[64];
+            snprintf(tbl, sizeof(tbl), "tbl_group_%s", uids[i]);
+            if (table_exists(app_db, tbl)) {
+                q = sqlite3_mprintf("DELETE FROM %s WHERE itemId='TBSH00001';", tbl);
+                sqlite3_exec(app_db, q, NULL, NULL, NULL);
+                sqlite3_free(q);
+            }
+
+            snprintf(tbl, sizeof(tbl), "tbl_info_%s", uids[i]);
+            if (table_exists(app_db, tbl)) {
+                q = sqlite3_mprintf("DELETE FROM %s WHERE key='nsx_content_flag_TBSH00001';", tbl);
+                sqlite3_exec(app_db, q, NULL, NULL, NULL);
+                sqlite3_free(q);
+            }
+        }
+        sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL);
+
+        if (appinfo_db) {
+            sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+            sqlite3_exec(appinfo_db, "DELETE FROM tbl_appinfo WHERE titleId='TBSH00001';", NULL, NULL, NULL);
+            sqlite3_exec(appinfo_db, "DELETE FROM tbl_conceptinfo WHERE local_concept_id='cid:local:TBSH00001';", NULL, NULL, NULL);
+            sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL);
+        }
+    }
+
+    /* 3. Remove any remaining app and metadata directories on disk */
+    remove_tree("/user/app/TBSH00001");
+    remove_tree("/user/appmeta/TBSH00001");
+    remove_tree("/system_data/priv/appmeta/TBSH00001");
+}
+
 /* ========================================================================= */
 /*               CORE DATABASE OPERATIONS (EXACT V1.2.1 + UNIVERSAL)         */
 /* ========================================================================= */
@@ -550,34 +826,23 @@ static int internal_shift_single(sqlite3 *app_db, sqlite3 *appinfo_db,
     }
     if (local_cid[0] == '\0') snprintf(local_cid, sizeof(local_cid), "cid:local:%s", title_id);
 
-    int cat_type = (target_loc == DISP_LOCATION_MEDIA) ? CATEGORY_MEDIA_APP :
-                   ((strncmp(title_id, "CUSA", 4) == 0) ? CATEGORY_PS4_GAME : CATEGORY_PS5_GAME);
-    int is_video = (target_loc == DISP_LOCATION_MEDIA) ? 1 : 0;
     int concept_loc = (target_loc == DISP_LOCATION_MEDIA) ? CONCEPT_LOC_MEDIA : CONCEPT_LOC_GAMES;
 
-    char hub_uri[128];
-    if (target_loc == DISP_LOCATION_MEDIA) {
-        snprintf(hub_uri, sizeof(hub_uri), "psmediahub:main?titleId=%s", title_id);
-    } else {
-        snprintf(hub_uri, sizeof(hub_uri), "pshome:gamehub?titleId=%s", title_id);
-    }
-
-    /* 1. Update tbl_contentinfo: Supports both Flat JSON (json_set) and Legacy field_list JSON */
+    /* 1. Update tbl_contentinfo: Preserve categoryType, is3rdPartyVideoApp, and pprHubAppUri so apps/emulators still launch */
     if (app_json && strstr(app_json, "\"field_list\"") != NULL) {
         char *patched_fl = update_concept_info_json(app_json, target_loc);
         char *q = sqlite3_mprintf(
-            "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, "
-            "pprHubAppUri = %Q, AppInfoJson = %Q WHERE titleId = %Q;",
-            target_loc, cat_type, is_video, hub_uri, patched_fl ? patched_fl : app_json, title_id);
+            "UPDATE tbl_contentinfo SET dispLocation = %d, AppInfoJson = %Q WHERE titleId = %Q;",
+            target_loc, patched_fl ? patched_fl : app_json, title_id);
         sqlite3_exec(app_db, q, NULL, NULL, NULL);
         sqlite3_free(q);
         free(patched_fl);
     } else {
         char *q = sqlite3_mprintf(
-            "UPDATE tbl_contentinfo SET dispLocation = %d, categoryType = %d, is3rdPartyVideoApp = %d, "
-            "pprHubAppUri = %Q, AppInfoJson = json_set(AppInfoJson, '$.DISPLAYLOCATION', %d, '$.CATEGORY_TYPE', %d, '$.HUBAPP_URI', %Q) "
-            "WHERE titleId = %Q;",
-            target_loc, cat_type, is_video, hub_uri, target_loc, cat_type, hub_uri, title_id);
+            "UPDATE tbl_contentinfo SET dispLocation = %d, "
+            "AppInfoJson = CASE WHEN json_valid(AppInfoJson) AND instr(AppInfoJson, '\"field_list\"')=0 "
+            "THEN json_set(AppInfoJson, '$.DISPLAYLOCATION', %d) ELSE AppInfoJson END WHERE titleId = %Q;",
+            target_loc, target_loc, title_id);
         sqlite3_exec(app_db, q, NULL, NULL, NULL);
         sqlite3_free(q);
     }
@@ -603,26 +868,23 @@ static int internal_shift_single(sqlite3 *app_db, sqlite3 *appinfo_db,
     }
     free(cjson);
 
-    /* 3. Update User Tables (1162 / 2236 for tbl_concepticoninfo) */
+    /* 3. Update User Tables (1162 / 2236 for tbl_concepticoninfo), preserving hubAppUri */
     for (int i = 0; i < uid_count; i++) {
         char *q = sqlite3_mprintf(
-            "UPDATE tbl_iconinfo_%s SET dispLocation = %d, visible = 1, hubAppUri = %Q, emsDeletedFlag = 0 WHERE titleId = %Q;"
-            "UPDATE tbl_concepticoninfo_%s SET dispLocation = %d, validFlag = 1, hubAppUri = %Q WHERE primaryTitleId = %Q OR localConceptId = %Q;",
-            uids[i], target_loc, hub_uri, title_id,
-            uids[i], concept_loc, hub_uri, title_id, local_cid);
+            "UPDATE tbl_iconinfo_%s SET dispLocation = %d, visible = 1, emsDeletedFlag = 0 WHERE titleId = %Q;"
+            "UPDATE tbl_concepticoninfo_%s SET dispLocation = %d, validFlag = 1 WHERE primaryTitleId = %Q OR localConceptId = %Q;",
+            uids[i], target_loc, title_id,
+            uids[i], concept_loc, title_id, local_cid);
         sqlite3_exec(app_db, q, NULL, NULL, NULL);
         sqlite3_free(q);
     }
 
-    /* 4. Update appinfo.db */
+    /* 4. Update appinfo.db (only display location keys, preserving CATEGORY_TYPE and HUBAPP_URI) */
     if (appinfo_db) {
         char *qa = sqlite3_mprintf(
             "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'DISPLAYLOCATION';"
-            "UPDATE tbl_appinfo SET val = %d WHERE titleId = %Q AND key = 'CATEGORY_TYPE';"
-            "UPDATE tbl_appinfo SET val = %Q WHERE titleId = %Q AND key = 'HUBAPP_URI';"
-            "UPDATE tbl_conceptinfo SET val = %d WHERE local_concept_id = %Q AND key = 'display_location';"
-            "UPDATE tbl_conceptinfo SET val = %Q WHERE local_concept_id = %Q AND key = 'hubapp_uri';",
-            target_loc, title_id, cat_type, title_id, hub_uri, title_id, concept_loc, local_cid, hub_uri, local_cid);
+            "UPDATE tbl_conceptinfo SET val = %d WHERE local_concept_id = %Q AND key = 'display_location';",
+            target_loc, title_id, concept_loc, local_cid);
         sqlite3_exec(appinfo_db, qa, NULL, NULL, NULL);
         sqlite3_free(qa);
     }
@@ -792,7 +1054,9 @@ static int execute_smart_tidy(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MA
     return SQLITE_OK;
 }
 
-static int repair_all_padlocks(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[MAX_USER_PROFILES][32], int uid_count) {
+static int repair_all_padlocks(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_ptr, char uids[MAX_USER_PROFILES][32], int uid_count) {
+    sqlite3 *app_db = *app_db_ptr;
+    sqlite3 *appinfo_db = *appinfo_db_ptr;
     sqlite3_stmt *stmt;
     char tids[512][16];
     int locs[512];
@@ -822,7 +1086,9 @@ static int repair_all_padlocks(sqlite3 *app_db, sqlite3 *appinfo_db, char uids[M
     if (appinfo_db) sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL);
     sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL);
 
-    install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
+    if (!is_tile_removal_requested() && !is_tbsh_tile_already_installed(*app_db_ptr)) {
+        install_tabshifter_launcher(app_db_ptr, appinfo_db_ptr, uids, uid_count);
+    }
     return SQLITE_OK;
 }
 
@@ -834,47 +1100,98 @@ static int restore_clean_db_backup(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_pt
     const char *info_bak = "/system_data/priv/mms/appinfo.db.tabshifter.bak";
     if (stat(info_bak, &st) != 0) info_bak = "/system_data/priv/mms/appinfo.db.bak";
 
-    if (stat(app_bak, &st) != 0) return -1;
+    if (stat(app_bak, &st) != 0 || !*app_db_ptr) return -1;
 
-    if (*appinfo_db_ptr) { sqlite3_close(*appinfo_db_ptr); *appinfo_db_ptr = NULL; }
-    if (*app_db_ptr)     { sqlite3_close(*app_db_ptr);     *app_db_ptr = NULL; }
+    sqlite3 *app_db = *app_db_ptr;
+    sqlite3 *appinfo_db = *appinfo_db_ptr;
 
-    unlink("/system_data/priv/mms/app.db-wal");
-    unlink("/system_data/priv/mms/app.db-shm");
-    unlink("/system_data/priv/mms/appinfo.db-wal");
-    unlink("/system_data/priv/mms/appinfo.db-shm");
+    sqlite3_exec(app_db, "DETACH DATABASE bak;", NULL, NULL, NULL);
+    char *q_att = sqlite3_mprintf("ATTACH DATABASE %Q AS bak;", app_bak);
+    int rc = q_att ? sqlite3_exec(app_db, q_att, NULL, NULL, NULL) : SQLITE_NOMEM;
+    sqlite3_free(q_att);
+    if (rc != SQLITE_OK) return -1;
 
-    FILE *src = fopen(app_bak, "rb");
-    FILE *dst = fopen(APP_DB_PATH, "wb");
-    if (src && dst) {
-        char buf[65536]; size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
-        fflush(dst); fsync(fileno(dst));
-    }
-    if (src) fclose(src);
-    if (dst) fclose(dst);
-
-    src = fopen(info_bak, "rb");
-    dst = fopen(APPINFO_DB_PATH, "wb");
-    if (src && dst) {
-        char buf[65536]; size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
-        fflush(dst); fsync(fileno(dst));
-    }
-    if (src) fclose(src);
-    if (dst) fclose(dst);
-
-    if (sqlite3_open(APP_DB_PATH, app_db_ptr) == SQLITE_OK) {
-        sqlite3_busy_timeout(*app_db_ptr, SQLITE_BUSY_TIMEOUT_MS);
-        sqlite3_exec(*app_db_ptr, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
-    }
-    if (sqlite3_open(APPINFO_DB_PATH, appinfo_db_ptr) == SQLITE_OK) {
-        sqlite3_busy_timeout(*appinfo_db_ptr, SQLITE_BUSY_TIMEOUT_MS);
-        sqlite3_exec(*appinfo_db_ptr, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+    if (sqlite3_exec(app_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(app_db, "DETACH DATABASE bak;", NULL, NULL, NULL);
+        return -1;
     }
 
-    if (*app_db_ptr) {
-        install_tabshifter_launcher(*app_db_ptr, *appinfo_db_ptr, uids, uid_count);
+    /* Merge layout and original app flags from backup in-place via SQLite WAL without deleting post-backup PS4 FPKGs or apps */
+    sqlite3_exec(app_db,
+        "UPDATE tbl_contentinfo "
+        "SET dispLocation = b.dispLocation, categoryType = b.categoryType, "
+        "is3rdPartyVideoApp = b.is3rdPartyVideoApp, pprHubAppUri = b.pprHubAppUri, AppInfoJson = b.AppInfoJson "
+        "FROM bak.tbl_contentinfo AS b WHERE tbl_contentinfo.titleId = b.titleId;"
+        "UPDATE tbl_conceptmetadata "
+        "SET dispLocation = b.dispLocation, ConceptInfoJson = b.ConceptInfoJson "
+        "FROM bak.tbl_conceptmetadata AS b WHERE tbl_conceptmetadata.localConceptId = b.localConceptId;",
+        NULL, NULL, NULL);
+
+    for (int i = 0; i < uid_count; i++) {
+        char tbl[64];
+        snprintf(tbl, sizeof(tbl), "tbl_iconinfo_%s", uids[i]);
+        if (schema_table_exists(app_db, "main", tbl) && schema_table_exists(app_db, "bak", tbl)) {
+            char *q = sqlite3_mprintf(
+                "UPDATE %s SET dispLocation = b.dispLocation, visible = b.visible, pinnedStatus = b.pinnedStatus, "
+                "hubAppUri = b.hubAppUri, emsDeletedFlag = b.emsDeletedFlag, emsPushedFlag = b.emsPushedFlag "
+                "FROM bak.%s AS b WHERE %s.titleId = b.titleId;",
+                tbl, tbl, tbl);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+        }
+
+        snprintf(tbl, sizeof(tbl), "tbl_concepticoninfo_%s", uids[i]);
+        if (schema_table_exists(app_db, "main", tbl) && schema_table_exists(app_db, "bak", tbl)) {
+            char *q = sqlite3_mprintf(
+                "UPDATE %s SET dispLocation = b.dispLocation, validFlag = b.validFlag, hubAppUri = b.hubAppUri "
+                "FROM bak.%s AS b WHERE %s.localConceptId = b.localConceptId;",
+                tbl, tbl, tbl);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+        }
+
+        snprintf(tbl, sizeof(tbl), "tbl_info_%s", uids[i]);
+        if (schema_table_exists(app_db, "main", tbl) && schema_table_exists(app_db, "bak", tbl)) {
+            char *q = sqlite3_mprintf(
+                "DELETE FROM %s WHERE key LIKE 'nsx_content_flag_%%' "
+                "AND substr(key, 18) IN (SELECT titleId FROM bak.tbl_contentinfo);"
+                "INSERT OR REPLACE INTO %s (key, value) "
+                "SELECT key, value FROM bak.%s WHERE key LIKE 'nsx_content_flag_%%';",
+                tbl, tbl, tbl);
+            sqlite3_exec(app_db, q, NULL, NULL, NULL);
+            sqlite3_free(q);
+        }
+    }
+
+    if (sqlite3_exec(app_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(app_db, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    sqlite3_exec(app_db, "DETACH DATABASE bak;", NULL, NULL, NULL);
+
+    if (appinfo_db && stat(info_bak, &st) == 0) {
+        sqlite3_exec(appinfo_db, "DETACH DATABASE bak;", NULL, NULL, NULL);
+        char *qa_att = sqlite3_mprintf("ATTACH DATABASE %Q AS bak;", info_bak);
+        if (qa_att && sqlite3_exec(appinfo_db, qa_att, NULL, NULL, NULL) == SQLITE_OK) {
+            if (sqlite3_exec(appinfo_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK) {
+                sqlite3_exec(appinfo_db,
+                    "UPDATE tbl_appinfo SET val = b.val FROM bak.tbl_appinfo AS b "
+                    "WHERE tbl_appinfo.titleId = b.titleId AND tbl_appinfo.key = b.key "
+                    "AND b.key IN ('DISPLAYLOCATION', 'CATEGORY_TYPE', 'HUBAPP_URI');"
+                    "UPDATE tbl_conceptinfo SET val = b.val FROM bak.tbl_conceptinfo AS b "
+                    "WHERE tbl_conceptinfo.local_concept_id = b.local_concept_id AND tbl_conceptinfo.key = b.key "
+                    "AND b.key IN ('display_location', 'hubapp_uri');",
+                    NULL, NULL, NULL);
+                if (sqlite3_exec(appinfo_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+                    sqlite3_exec(appinfo_db, "ROLLBACK;", NULL, NULL, NULL);
+                }
+            }
+            sqlite3_exec(appinfo_db, "DETACH DATABASE bak;", NULL, NULL, NULL);
+        }
+        sqlite3_free(qa_att);
+    }
+
+    if (*app_db_ptr && !is_tile_removal_requested()) {
+        install_tabshifter_launcher(app_db_ptr, appinfo_db_ptr, uids, uid_count);
     }
 
     return 0;
@@ -887,7 +1204,7 @@ static int restore_clean_db_backup(sqlite3 **app_db_ptr, sqlite3 **appinfo_db_pt
 static const char *WEB_UI_HTML =
 "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-"<title>PS5-TabShifter v1.3.0</title>"
+"<title>PS5-TabShifter v1.4.0</title>"
 "<style>"
 "*{box-sizing:border-box;margin:0;padding:0}"
 "body{background:#0b0e14;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding-bottom:90px}"
@@ -943,12 +1260,14 @@ static const char *WEB_UI_HTML =
 "</div>"
 "<div class='sticky-top'>"
 "  <div class='top-inner'>"
-"    <h1>PS5-TabShifter <span class='badge'>v1.3.0</span></h1>"
+"    <h1>PS5-TabShifter <span class='badge'>v1.4.0</span></h1>"
 "    <div class='top-controls'>"
 "      <button type='button' class='btn btn-apply' id='apply-btn' onclick='applyAndReload()'>Apply &amp; Reload PS5 UI (<span id='q-count'>0</span>)</button>"
 "      <button type='button' class='btn btn-primary' onclick='smartTidy()'>Smart Tidy</button>"
 "      <button type='button' class='btn btn-warn' onclick='fixPadlocks()'>Fix Padlocks</button>"
 "      <button type='button' class='btn btn-danger' onclick='restoreOriginalDb()'>Restore DB Backup</button>"
+"      <button type='button' class='btn btn-primary' id='tile-btn' style='display:none' onclick='installTile()'>Add Media Tile</button>"
+"      <button type='button' class='btn btn-danger' onclick='uninstallTabShifter()'>Uninstall</button>"
 "    </div>"
 "  </div>"
 "</div>"
@@ -966,7 +1285,7 @@ static const char *WEB_UI_HTML =
 "    </div>"
 "  </div>"
 "  <div class='app-list' id='app-list'></div>"
-"  <div class='footer'>PS5-TabShifter v1.3.0 by xvvulcanvx &bull; <a href='https://github.com/xvvulcanvx/PS5-TabShifter' target='_blank'>GitHub</a></div>"
+"  <div class='footer'>PS5-TabShifter v1.4.0 by xvvulcanvx &bull; <a href='https://github.com/xvvulcanvx/PS5-TabShifter' target='_blank'>GitHub</a></div>"
 "</div>"
 "<div id='toast'></div>"
 "<script>"
@@ -1056,11 +1375,25 @@ static const char *WEB_UI_HTML =
 "  }"
 "}"
 "async function restoreOriginalDb(){"
-"  if(confirm('Restore original untouched database backup?')){"
+"  if(confirm('Restore original tab layout & visibility from backup? Newly installed games and PS4 FPKGs will be kept.')){"
 "    const res=await fetch('/api/restore-backup',{method:'POST'});"
-"    if(res.ok){showToast('Original database restored! PS5 UI reloaded.');setTimeout(()=>location.reload(),2000);}"
+"    if(res.ok){showToast('Original layout restored (new apps kept)! Reboot PS5 if an earlier flicker persists.');setTimeout(()=>location.reload(),2000);}"
 "    else{alert('No backup file found on disk!');}"
 "  }"
+"}"
+"async function uninstallTabShifter(){"
+"  if(confirm('Remove the TabShifter tile from the Media tab for all users, delete its files and stop the payload? Your app layout and DB backups are kept.')){"
+"    const res=await fetch('/api/uninstall',{method:'POST'});"
+"    if(res.ok){document.querySelector('.container').innerHTML='<h1>TabShifter uninstalled</h1><p style=\"margin-top:12px;color:#8b949e\">The Media tile has been removed and the payload has stopped. Delete TabShifter.elf from Payload Manager or your payloads folder to remove it completely.</p>';}"
+"    else{alert('Uninstall failed.');}"
+"  }"
+"}"
+"async function installTile(){"
+"  const res=await fetch('/api/install-tile',{method:'POST'});"
+"  if(res.ok){document.getElementById('tile-btn').style.display='none';showToast('TabShifter tile added & PS5 UI reloaded!');}"
+"}"
+"async function checkTile(){"
+"  try{const v=await fetch('/api/version').then(r=>r.json());if(v.tile===false)document.getElementById('tile-btn').style.display='inline-block';}catch(e){}"
 "}"
 "function toggleChangelog(){"
 "  const d=document.getElementById('changelog-drawer');"
@@ -1102,7 +1435,7 @@ static const char *WEB_UI_HTML =
 "    else{btn.textContent='Update Failed';btn.disabled=false;}"
 "  }catch(e){btn.textContent='Error';btn.disabled=false;}"
 "}"
-"loadApps();checkGitHubUpdate();"
+"loadApps();checkTile();checkGitHubUpdate();"
 "</script></body></html>";
 
 /* ========================================================================= */
@@ -1256,12 +1589,33 @@ static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **ap
         free(req);
         close(client_fd);
         return false;
+    } else if (strncmp((char *)req, "POST /api/uninstall ", 20) == 0 || strncmp((char *)req, "POST /api/uninstall?", 20) == 0) {
+        uninstall_tabshifter_launcher(app_db_ptr, appinfo_db_ptr, uids, uid_count);
+        set_tile_removal_marker(true);
+        send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
+        free(req);
+        close(client_fd);
+        reload_sceshellui();
+        notify_ps5("TabShifter uninstalled.\nDelete TabShifter.elf to remove the payload.");
+        return false;
+    } else if (strncmp((char *)req, "POST /api/install-tile ", 23) == 0 || strncmp((char *)req, "POST /api/install-tile?", 23) == 0) {
+        set_tile_removal_marker(false);
+        install_tabshifter_launcher(app_db_ptr, appinfo_db_ptr, uids, uid_count);
+        send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
+        free(req);
+        close(client_fd);
+        reload_sceshellui();
+        return true;
     } else if (strncmp((char *)req, "GET / ", 6) == 0 || strncmp((char *)req, "GET /?", 6) == 0) {
         send_http_response(client_fd, 200, "text/html; charset=utf-8", WEB_UI_HTML, strlen(WEB_UI_HTML));
     } else if (strncmp((char *)req, "GET /api/version", 16) == 0) {
-        char elf_path[512], vjson[640];
+        char elf_path[512], esc_elf_path[560], vjson[768];
         get_running_elf_path(elf_path, sizeof(elf_path));
-        int vlen = snprintf(vjson, sizeof(vjson), "{\"version\":\"%s\",\"elf_path\":\"%s\"}", TABSHIFTER_VERSION, elf_path);
+        json_escape_str(elf_path, esc_elf_path, sizeof(esc_elf_path));
+        int vlen = snprintf(vjson, sizeof(vjson), "{\"version\":\"%s\",\"elf_path\":\"%s\",\"tile\":%s}",
+                            TABSHIFTER_VERSION, esc_elf_path, tbsh_tile_row_exists(app_db) ? "true" : "false");
+        if (vlen < 0) vlen = 0;
+        if (vlen >= (int)sizeof(vjson)) vlen = (int)sizeof(vjson) - 1;
         send_http_response(client_fd, 200, "application/json", vjson, (size_t)vlen);
     } else if (strncmp((char *)req, "GET /api/apps", 13) == 0) {
         char *ajson = build_apps_json(app_db, uids[0]);
@@ -1277,7 +1631,7 @@ static bool handle_http_client(int client_fd, sqlite3 **app_db_ptr, sqlite3 **ap
         reload_sceshellui();
         send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strncmp((char *)req, "POST /api/fix-padlocks", 22) == 0) {
-        repair_all_padlocks(app_db, appinfo_db, uids, uid_count);
+        repair_all_padlocks(app_db_ptr, appinfo_db_ptr, uids, uid_count);
         reload_sceshellui();
         send_http_response(client_fd, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strncmp((char *)req, "POST /api/restore-backup", 24) == 0) {
@@ -1318,36 +1672,44 @@ int main(void) {
     sqlite3 *appinfo_db = NULL;
     char uids[MAX_USER_PROFILES][32];
 
-    if (sqlite3_open(APP_DB_PATH, &app_db) != SQLITE_OK) {
+    if (!open_mms_databases(&app_db, &appinfo_db)) {
         notify_ps5("TabShifter Error: Failed to open app.db");
         return 1;
-    }
-    sqlite3_busy_timeout(app_db, SQLITE_BUSY_TIMEOUT_MS);
-    sqlite3_exec(app_db, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
-
-    if (sqlite3_open(APPINFO_DB_PATH, &appinfo_db) == SQLITE_OK) {
-        sqlite3_busy_timeout(appinfo_db, SQLITE_BUSY_TIMEOUT_MS);
-        sqlite3_exec(appinfo_db, "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
-    } else {
-        appinfo_db = NULL;
     }
 
     int uid_count = get_all_user_ids(app_db, uids);
     if (uid_count <= 0) {
         notify_ps5("TabShifter Error: No user tables found");
-        if (appinfo_db) sqlite3_close(appinfo_db);
-        sqlite3_close(app_db);
+        close_mms_databases(&app_db, &appinfo_db);
         return 1;
     }
 
-    bool already_installed = is_tbsh_tile_already_installed(app_db);
-    install_tabshifter_launcher(app_db, appinfo_db, uids, uid_count);
-    if (!already_installed) {
+    struct stat app_dir_st;
+    bool tile_shown = true;
+    if (tbsh_has_db_or_meta_remnants(app_db, appinfo_db) && stat("/user/app/TBSH00001", &app_dir_st) != 0) {
+        /* Deleted from the PS5 home screen: clean up leftover DB rows/metadata and remember choice. */
+        uninstall_tabshifter_launcher(&app_db, &appinfo_db, uids, uid_count);
+        set_tile_removal_marker(true);
+        reload_sceshellui();
+        tile_shown = false;
+    } else if (is_tile_removal_requested()) {
+        tile_shown = false;
+    } else if (!is_tbsh_tile_already_installed(app_db)) {
+        install_tabshifter_launcher(&app_db, &appinfo_db, uids, uid_count);
         reload_sceshellui();
     }
 
+    if (!app_db) {
+        notify_ps5("TabShifter Error: Failed to reopen app.db");
+        close_mms_databases(&app_db, &appinfo_db);
+        return 1;
+    }
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) return 1;
+    if (server_fd < 0) {
+        close_mms_databases(&app_db, &appinfo_db);
+        return 1;
+    }
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -1361,12 +1723,15 @@ int main(void) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(server_fd, 8) < 0) {
         notify_ps5("TabShifter: Port %d busy!\nReboot PS5 once to clear.", HTTP_PORT);
         close(server_fd);
-        if (appinfo_db) sqlite3_close(appinfo_db);
-        sqlite3_close(app_db);
+        close_mms_databases(&app_db, &appinfo_db);
         return 1;
     }
 
-    notify_ps5("PS5 TabShifter v1.3.0 Ready!\nOpen TabShifter from your Media Tab!");
+    if (tile_shown) {
+        notify_ps5("PS5 TabShifter v1.4.0 Ready!\nOpen TabShifter from your Media Tab!");
+    } else {
+        notify_ps5("PS5 TabShifter v1.4.0 Ready!\nOpen http://<PS5_IP>:%d/ in a browser.", HTTP_PORT);
+    }
 
     bool running = true;
     while (running) {
@@ -1377,7 +1742,6 @@ int main(void) {
     }
 
     close(server_fd);
-    if (appinfo_db) sqlite3_close(appinfo_db);
-    sqlite3_close(app_db);
+    close_mms_databases(&app_db, &appinfo_db);
     return 0;
 }
