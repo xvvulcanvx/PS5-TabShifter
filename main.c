@@ -25,6 +25,7 @@
 
 #define TBSH_STATE_DIR          "/data/tabshifter"
 #define TBSH_REMOVED_MARKER     TBSH_STATE_DIR "/tile_removed"
+#define TBSH_INSTALLED_MARKER   TBSH_STATE_DIR "/tile_installed"
 
 #define APP_DB_PATH             "/system_data/priv/mms/app.db"
 #define APPINFO_DB_PATH         "/system_data/priv/mms/appinfo.db"
@@ -542,19 +543,28 @@ static int appinst_install_title_dir(const char *title_id, const char *dir) {
     return sceAppInstUtilAppInstallAll(NULL);
 }
 
-static bool is_tile_removal_requested(void) {
+static bool marker_exists(const char *path) {
     struct stat st;
-    return stat(TBSH_REMOVED_MARKER, &st) == 0;
+    return stat(path, &st) == 0;
+}
+
+static void set_marker(const char *path, bool present) {
+    if (present) {
+        mkdir(TBSH_STATE_DIR, 0777);
+        FILE *fp = fopen(path, "wb");
+        if (fp) fclose(fp);
+    } else {
+        unlink(path);
+    }
+}
+
+static bool is_tile_removal_requested(void) {
+    return marker_exists(TBSH_REMOVED_MARKER);
 }
 
 static void set_tile_removal_marker(bool removed) {
-    if (removed) {
-        mkdir(TBSH_STATE_DIR, 0777);
-        FILE *fp = fopen(TBSH_REMOVED_MARKER, "wb");
-        if (fp) fclose(fp);
-    } else {
-        unlink(TBSH_REMOVED_MARKER);
-    }
+    set_marker(TBSH_REMOVED_MARKER, removed);
+    if (removed) set_marker(TBSH_INSTALLED_MARKER, false);
 }
 
 static bool tbsh_tile_row_exists(sqlite3 *app_db) {
@@ -566,25 +576,6 @@ static bool tbsh_tile_row_exists(sqlite3 *app_db) {
         sqlite3_finalize(stmt);
     }
     return exists;
-}
-
-static bool tbsh_has_db_or_meta_remnants(sqlite3 *app_db, sqlite3 *appinfo_db) {
-    if (tbsh_tile_row_exists(app_db)) return true;
-
-    if (appinfo_db) {
-        sqlite3_stmt *stmt;
-        bool exists = false;
-        if (sqlite3_prepare_v2(appinfo_db, "SELECT 1 FROM tbl_appinfo WHERE titleId='TBSH00001' LIMIT 1;", -1, &stmt, NULL) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
-            sqlite3_finalize(stmt);
-        }
-        if (exists) return true;
-    }
-
-    struct stat st;
-    if (stat("/user/appmeta/TBSH00001", &st) == 0) return true;
-    if (stat("/system_data/priv/appmeta/TBSH00001", &st) == 0) return true;
-    return false;
 }
 
 static void remove_tree(const char *path) {
@@ -648,6 +639,7 @@ static void install_tabshifter_launcher(sqlite3 **app_db_ptr, sqlite3 **appinfo_
     }
 
     if (inst_rc == 0 && tbsh_tile_row_exists(*app_db_ptr)) {
+        set_marker(TBSH_INSTALLED_MARKER, true);
         return;
     }
 
@@ -738,6 +730,10 @@ static void install_tabshifter_launcher(sqlite3 **app_db_ptr, sqlite3 **appinfo_
                      "WHEN key='_uninstallable' THEN 1 ELSE val END "
                      "FROM tbl_appinfo WHERE titleId=(SELECT titleId FROM tbl_appinfo WHERE key='TITLE_ID' ORDER BY (titleId='PLDM00001') DESC LIMIT 1);"
                      "COMMIT;", NULL, NULL, NULL);
+    }
+
+    if (tbsh_tile_row_exists(*app_db_ptr)) {
+        set_marker(TBSH_INSTALLED_MARKER, true);
     }
 }
 
@@ -1784,8 +1780,9 @@ int main(void) {
 
     struct stat app_dir_st;
     bool tile_shown = true;
-    if (tbsh_has_db_or_meta_remnants(app_db, appinfo_db) && stat("/user/app/TBSH00001", &app_dir_st) != 0) {
-        /* Deleted from the PS5 home screen: clean up leftover DB rows/metadata and remember choice. */
+    if (marker_exists(TBSH_INSTALLED_MARKER) &&
+        (!tbsh_tile_row_exists(app_db) || stat("/user/app/TBSH00001", &app_dir_st) != 0)) {
+        /* Deleted from the PS5 home screen after TabShifter installed it: clean up and remember choice. */
         uninstall_tabshifter_launcher(&app_db, &appinfo_db, uids, uid_count);
         set_tile_removal_marker(true);
         reload_sceshellui();
@@ -1795,6 +1792,8 @@ int main(void) {
     } else if (!is_tbsh_tile_already_installed(app_db)) {
         install_tabshifter_launcher(&app_db, &appinfo_db, uids, uid_count);
         reload_sceshellui();
+    } else {
+        set_marker(TBSH_INSTALLED_MARKER, true);
     }
 
     if (!app_db) {
